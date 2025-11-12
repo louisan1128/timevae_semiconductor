@@ -1,0 +1,11 @@
+공유 변수 (수정 가능)
+
+latent_dim = 32
+condition_dim = 10
+B = 32  ##batch size
+L = 36  ##sequnce length
+D = 8   ##feature dimension
+H = 12  ##predicting length
+
+
+###input tensor dimension (B, L, D)
