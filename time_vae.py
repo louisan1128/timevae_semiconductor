@@ -1,5 +1,5 @@
-import decoder
-import encoder
+from encoder import Encoder
+from decoder import Decoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,20 +19,30 @@ class TimeVAE(nn.Module):
         return mu + eps * std
     
     def forward(self, x, c, y=None):
-        ##x: (B, L, D)    = input sequence (과거 36개월)
-        ##y: (B, H, D)    = target sequence (미래 12개월)
+        ## x: (B, L, D)
+        ## y: (B, H, D)
 
+        #encode
         mu, logvar = self.encoder(x, c)
 
+        #latent z
         z = self.reparameterize(mu, logvar)
 
+        #decode
         mean, dist = self.decoder(z, c)
 
+        #추론할때
+        if y is None:
+            return mean, z, (mu, logvar)
+
+        #reconstruction loss
         recon_loss = -dist.log_prob(y).mean()
 
+        #KL divergence
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         kl_loss = kl_loss / x.size(0)
 
+        #final loss
         loss = recon_loss + self.beta * kl_loss
 
         return loss, recon_loss, kl_loss, mean, z
