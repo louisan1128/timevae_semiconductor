@@ -13,3 +13,7 @@ H = 12  ##predicting length
 x = 과거 시계열 (L 길이)
 c = 조건 벡터 (현재 환경/상황)
 y = 미래 시계열 (H 길이, 정답)
+
+x: (B, L, D)
+y: (B, H, D)
+c: (B, condition_dim)
