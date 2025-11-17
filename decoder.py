@@ -5,7 +5,7 @@ from torch.distributions import StudentT
 import math
 
 latent_dim = 32
-condition_dim = 10
+condition_dim = 5
 B = 32  ##batch size
 L = 36  ##sequnce length
 D = 8   ##feature dimension
@@ -59,8 +59,12 @@ class Decoder(nn.Module):
         mean = trend + sea + residual
 
         ## Student-t params
-        scale = torch.softplus(self.fc_scale(h)).view(-1, self.H, self.out_dim) + 1e-3
-        df    = torch.softplus(self.fc_df(h)) + 2.0   # degree of freedom > 2
+        scale = F.softplus(self.fc_scale(h)).view(-1, self.H, self.out_dim) + 1e-3
+        df    = F.softplus(self.fc_df(h)) + 2.0   # degree of freedom > 2
+
+        # df shape: (B,1) → (B,H,out_dim)
+        df = df.unsqueeze(1)
+        df = df.expand(-1, self.H, self.out_dim)
 
         dist = StudentT(df, loc=mean, scale=scale)
 
