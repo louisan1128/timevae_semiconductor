@@ -188,21 +188,21 @@ class Encoder(nn.Module):
                  tcn_layers=4, kernel_size=3):
         super().__init__()
 
-        # Condition Network
+        # 1) condition embedding
         self.condition_layer = ConditionLayer(c_dim, h_dim)
 
-        # Input projection (feature → hidden)
+        # 2) input projection
         self.input_proj = nn.Conv1d(x_dim, h_dim, kernel_size=1)
 
-        # Vanilla Causal TCN
-        self.tcn = TemporalConvNet(
-            num_inputs=h_dim,
-            num_channels=[h_dim] * tcn_layers,
+        # 3) FiLM + TCN layered
+        self.tcn_film = FiLM_TCN(
+            hidden_dim=h_dim,
+            tcn_layers=tcn_layers,
             kernel_size=kernel_size,
-            dropout=0.2
+            dropout=0.15
         )
 
-        # Latent
+        # 4) latent heads
         self.mu_layer = nn.Linear(h_dim, z_dim)
         self.logvar_layer = nn.Linear(h_dim, z_dim)
 
@@ -211,25 +211,22 @@ class Encoder(nn.Module):
         x: (B, L, x_dim)
         c: (B, c_dim)
         """
-
-        # (B, x_dim, L)
+        # input projection
         x = x.permute(0, 2, 1)
-        x = self.input_proj(x)
+        h = self.input_proj(x)        # (B, hidden, L)
 
-        # (B, L, h_dim)
-        x = x.permute(0, 2, 1)
-        c_embed = self.condition_layer(c).unsqueeze(1)
-        x = x + c_embed  # broadcast add
+        # condition embedding
+        c_embed = self.condition_layer(c)  # (B, hidden)
 
-        # (B, h_dim, L)
-        x = x.permute(0, 2, 1)
-        x = self.tcn(x)
+        # Layer-wise FiLM + TCN
+        h = self.tcn_film(h, c_embed)
 
-        # Last timestep representation
-        h_last = x[:, :, -1]
+        # last timestep
+        h_last = h[:, :, -1]
 
         mu = self.mu_layer(h_last)
         logvar = self.logvar_layer(h_last)
-
+        return mu, logvar
 
         return mu, logvar
+
