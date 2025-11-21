@@ -127,6 +127,61 @@ class TemporalConvNet(nn.Module):
     def forward(self, x):
         return self.network(x)
 
+class FiLM(nn.Module):
+    def __init__(self, cond_dim, hidden_dim):
+        super().__init__()
+        self.gamma = nn.Linear(cond_dim, hidden_dim)
+        self.beta  = nn.Linear(cond_dim, hidden_dim)
+
+    def forward(self, h, c):
+        """
+        h: (B, hidden, L)
+        c: (B, hidden)
+        """
+        γ = self.gamma(c).unsqueeze(-1)  # (B, hidden, 1)
+        β = self.beta(c).unsqueeze(-1)   # (B, hidden, 1)
+        return γ * h + β
+
+
+class FiLM_TCN(nn.Module):
+    def __init__(self, hidden_dim, tcn_layers=4, kernel_size=3, dropout=0.15):
+        super().__init__()
+
+        self.layers = nn.ModuleList()
+        self.films  = nn.ModuleList()
+
+        for i in range(tcn_layers):
+            dilation = 2 ** i
+            self.layers.append(
+                TemporalBlock(
+                    n_inputs=hidden_dim,
+                    n_outputs=hidden_dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout=dropout
+                )
+            )
+
+            # FiLM per layer
+            self.films.append(
+                FiLM(cond_dim=hidden_dim, hidden_dim=hidden_dim)
+            )
+
+    def forward(self, h, c_embed):
+        """
+        h: (B, hidden, L)
+        c_embed: (B, hidden)
+        """
+        # DO NOT unsqueeze here
+        # c_embed is (B, hidden)
+
+        for film, block in zip(self.films, self.layers):
+            h = film(h, c_embed)   # FiLM will unsqueeze inside
+            h = block(h)
+        return h
+
+
+
 
 class Encoder(nn.Module):
     def __init__(self, x_dim, c_dim, h_dim, z_dim,
@@ -175,5 +230,6 @@ class Encoder(nn.Module):
 
         mu = self.mu_layer(h_last)
         logvar = self.logvar_layer(h_last)
+
 
         return mu, logvar
