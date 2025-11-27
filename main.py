@@ -15,6 +15,10 @@ from scenario_eval import (
     evaluate_model,
     scenario_predict_local,
     plot_fanchart,
+    plot_fanchart_long,
+    rolling_posterior_forecast,
+    plot_full_forecast_and_scenario,
+    posterior_scenario
 )
 
 # -------------------------------
@@ -32,7 +36,7 @@ N_FOURIER = 3
 
 BETA = 1.0
 LR = 1e-3
-EPOCHS = 40          # rolling forward 재학습 시 epoch 많으면 오래 걸림
+EPOCHS = 80          # rolling forward 재학습 시 epoch 많으면 오래 걸림
 BATCH_SIZE = 32
 
 DEVICE = "cuda"
@@ -57,7 +61,7 @@ if __name__ == "__main__":
 
     print("========== 1) Preprocessing ==========")
 
-    X, Y, C, scaler, df_raw = preprocess(
+    X, Y, C, scaler, df_raw, df_scaled = preprocess(
         "data.csv",
         condition_raw_cols,
         L,
@@ -159,14 +163,16 @@ if __name__ == "__main__":
 
     # 실제 마지막 month의 RAW 값
     last_truth_raw = df_raw.iloc[-1]
+    print("===== Last RAW sample =====")
+    print(last_truth_raw)
 
     # 시나리오 조건 (RAW 형태)
     scenario_cond_raw = {
-        "Exchange Rate": 1500,
-        "CAPEX": 0.0,
-        "Global Manufacturing PMI": 53.0,
-        "OECD CLI": 100.5,
-        "U.S. ISM Manufacturing New Orders Index": 49.3,
+        "Exchange Rate": 1393.41,
+        "CAPEX": 96404.0,
+        "Global Manufacturing PMI": 52.4,
+        "OECD CLI": 100.35,
+        "U.S. ISM Manufacturing New Orders Index": 48.9,
     }
 
     # raw → scaled 변환
@@ -182,7 +188,7 @@ if __name__ == "__main__":
         for col in condition_raw_cols
     ])
 
-    # 시나리오 샘플링
+     # 시나리오 샘플링
     scenario_samples = scenario_predict_local(
         model_path="timevae_ctvae_prior.pth",
         X_last=X[-1],
@@ -198,7 +204,7 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
-    print("Scenario samples shape:", scenario_samples.shape)
+
 
     # =======================================
     # 7) Fan Chart 출력
@@ -212,4 +218,52 @@ if __name__ == "__main__":
         feature_index=0    # Export Index
     )
 
+    plot_fanchart_long(
+        true_seq_full=df_scaled.values,    # 전체 스케일된 시계열
+        pred_seq_last=preds[-1],           # 마지막 chunk prediction
+        scenario_samples=scenario_samples,
+        feature_index=0,
+        history=60                         # 5년치
+    )
+
+
     print("=========== Completed! ===========")
+
+    # 1) Rolling forecast (파란선)
+    forecast_full = rolling_posterior_forecast(
+        "timevae_ctvae_prior.pth",
+        X, C,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        beta=BETA,
+        device=DEVICE
+    )
+
+    # 2) 마지막 시점 scenario (빨간선)
+    scenario_samples = posterior_scenario(
+        "timevae_ctvae_prior.pth",
+        X_last=X[-1],
+        C_last=C[-1],
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        beta=BETA,
+        num_samples=50,
+        shrink=0.2,
+        device=DEVICE
+    )
+
+    # 3) true 전체 시계열 (각 chunk의 첫 y가 true future 1-step)
+    true_full = Y[:, 0, :]
+
+    # 4) Plot
+    plot_full_forecast_and_scenario(
+        true_full=true_full,
+        forecast_full=forecast_full,
+        scenario_samples=scenario_samples,
+        feature_index=0,
+        H=H
+    )

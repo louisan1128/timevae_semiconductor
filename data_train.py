@@ -83,7 +83,7 @@ def preprocess(csv_path, condition_raw_cols, L, H):
     print("Y shape:", Y.shape)  # (N,H,D)
     print("C shape:", C.shape)  # (N,cond_dim)
 
-    return X, Y, C, scaler, df_raw
+    return X, Y, C, scaler, df_raw, df_scaled
 
 
 
@@ -95,7 +95,7 @@ def train_model(
     latent_dim, cond_dim, hidden,
     H_len, beta, lr, epochs, batch_size, device
 ):
-    device = torch.device(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dim = X_train.shape[-1]
 
     train_dataset = TimeSeriesDataset(X_train, Y_train, C_train)
@@ -150,7 +150,7 @@ def rolling_backtest(model_path, X, Y, C,
                      latent_dim, cond_dim, hidden, H, beta,
                      device="cuda"):
 
-    device = torch.device(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dim = X.shape[-1]
 
     # 모델 구성 & 가중치 로드
@@ -194,7 +194,7 @@ def rolling_forward_test(X, Y, C,
         - Test: t -> t+H 예측
         - 모델 매번 재학습
     """
-    device = torch.device(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     N = len(X)
 
     mse_list = []
