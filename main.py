@@ -18,7 +18,18 @@ from scenario_eval import (
     plot_fanchart_long,
     rolling_posterior_forecast,
     plot_full_forecast_and_scenario,
-    posterior_scenario
+    posterior_scenario,
+
+
+    compute_point_forecast_metrics,
+    compute_coverage_and_sharpness,
+    compute_crps_from_samples,
+    student_t_nll_torch,
+    evaluate_student_t_nll,
+    compute_risk_metrics,
+    compare_models_point_forecast,
+    compare_models_probabilistic_nll
+
 )
 
 # -------------------------------
@@ -267,3 +278,64 @@ if __name__ == "__main__":
         feature_index=0,
         H=H
     )
+
+
+    point_metrics  = compute_point_forecast_metrics(preds, trues)
+    print("=== Point Forecast Metrics ===")
+    for k, v in point_metrics.items():
+        print(f"{k} : {v}")
+
+    
+    nll_metrics = evaluate_student_t_nll(
+        model_path="timevae_ctvae_prior.pth",
+        X=X, Y=Y, C=C,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        beta=BETA,
+        device=DEVICE
+    )
+
+    print("=== Probabilistic (Student-t) Metrics ===")
+    print("NLL_mean:", nll_metrics["NLL_mean"])
+    print("NLL_std :", nll_metrics["NLL_std"])
+
+
+    coverage = compute_coverage_and_sharpness(
+        scenario_samples,
+        true_future=Y[-1],
+        feature_index=0,   # export index
+        lower_q=10,
+        upper_q=90
+    )
+
+    print("=== Coverage / Sharpness ===")
+    print(coverage)
+
+    crps = compute_crps_from_samples(
+        scenario_samples,
+        true_future=Y[-1],
+        feature_index=0
+    )
+
+    print("=== CRPS ===")
+    print(crps)
+
+    current_level = X[-1][-1, 0]   # 마지막 시점 export (예: feature 0)
+
+    risk = compute_risk_metrics(
+        scenario_samples,
+        current_level=current_level,
+        feature_index=0,
+        horizon_idx=-1,
+        tail_threshold=-0.1,   # -10%
+        alpha=0.10
+    )
+
+    print("=== Risk Metrics ===")
+    for k, v in risk.items():
+        print(f"{k}: {v}")
+
+
+

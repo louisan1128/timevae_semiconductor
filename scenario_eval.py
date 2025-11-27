@@ -261,3 +261,311 @@ def plot_full_forecast_and_scenario(
     plt.grid(True)
     plt.legend()
     plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+########################
+####evaluation#########
+#########################
+
+# ===============================
+# Forecast Metrics (MSE / MAE / RMSE)
+# ===============================
+
+def compute_point_forecast_metrics(preds, trues):
+    """
+    preds: (N, D) or (N, H, D) 모두 가능. trues와 동일 shape 가정.
+    trues: same shape as preds
+    return: dict { 'MSE': ..., 'MAE': ..., 'RMSE': ... }
+    """
+    preds = np.array(preds)
+    trues = np.array(trues)
+
+    assert preds.shape == trues.shape, "preds와 trues shape가 다름"
+
+    diff = preds - trues
+    mse = np.mean(diff ** 2)
+    mae = np.mean(np.abs(diff))
+    rmse = np.sqrt(mse)
+
+    return {
+        "MSE": mse,
+        "MAE": mae,
+        "RMSE": rmse,
+    }
+
+# ===============================
+# Probabilistic Metrics (CRPS, Coverage, Sharpness)
+# ===============================
+
+def compute_coverage_and_sharpness(
+    scenario_samples,
+    true_future,
+    feature_index=0,
+    lower_q=10,
+    upper_q=90
+):
+    """
+    scenario_samples: (num_samples, H, D)
+    true_future:      (H, D)  -> 마지막 H-step의 실제 Y
+    feature_index:    어느 feature를 평가할지
+    lower_q, upper_q: 예: 10,90 => 80% 구간
+    """
+    scenario_samples = np.array(scenario_samples)
+    true_future = np.array(true_future)
+
+    lower = np.percentile(scenario_samples[:, :, feature_index], lower_q, axis=0)
+    upper = np.percentile(scenario_samples[:, :, feature_index], upper_q, axis=0)
+    true = true_future[:, feature_index]
+
+    inside = (true >= lower) & (true <= upper)
+    coverage = inside.mean()
+
+    # Sharpness: 구간 폭의 평균
+    width = upper - lower
+    sharpness = width.mean()
+
+    return {
+        f"Coverage_{upper_q-lower_q}%": coverage,
+        f"Sharpness_{upper_q-lower_q}%": sharpness
+    }
+
+def compute_crps_from_samples(scenario_samples, true_future, feature_index=0):
+    """
+    CRPS ~ E|S - y| - 0.5 E|S - S'|
+    scenario_samples: (num_samples, H, D)
+    true_future:      (H, D)
+    """
+    S = np.array(scenario_samples)[:, :, feature_index]  # (M, H)
+    y = np.array(true_future)[:, feature_index]          # (H,)
+
+    M, H = S.shape
+    # E|S - y|
+    term1 = np.mean(np.abs(S - y[None, :]), axis=0)  # (H,)
+
+    # E|S - S'|
+    # (M, H) vs (M, H) broadcast -> (M, M, H) 이라 메모리 크면 위험해서
+    # 조금 단순화: 일부 샘플만 사용하거나, 행 샘플링
+    # 여기서는 M이 크지 않다고 가정하고 full 사용
+    S1 = S[:, None, :]  # (M,1,H)
+    S2 = S[None, :, :]  # (1,M,H)
+    term2 = np.mean(np.abs(S1 - S2), axis=(0,1))  # (H,)
+
+    crps_per_h = term1 - 0.5 * term2
+    crps = crps_per_h.mean()
+
+    return {
+        "CRPS_mean": crps,
+        "CRPS_per_h": crps_per_h
+    }
+
+
+
+# ===============================
+# Student-t NLL (Decoder와 맞춘 버전)
+# ===============================
+
+def student_t_nll_torch(y, mean, scale, df, eps=1e-6):
+    """
+    y, mean, scale, df: torch.Tensor (broadcast 가능), shape 대략 (B, H, D)
+    TimeVAE decoder가 내놓는 Student-t likelihood와 맞추기 위한 NLL.
+    """
+    # 안정성용 epsilon
+    scale = scale + eps
+    df = df + eps
+
+    # (y - μ) / σ
+    t = (y - mean) / scale
+
+    # log 정규화 항
+    # log Γ((ν+1)/2) - log Γ(ν/2) - 0.5 log(νπ) - log σ
+    log_norm = (
+        torch.lgamma((df + 1.0) / 2.0)
+        - torch.lgamma(df / 2.0)
+        - 0.5 * torch.log(df * math.pi)
+        - torch.log(scale)
+    )
+
+    # kernel 부분: - (ν+1)/2 * log(1 + t^2 / ν)
+    log_kernel = - (df + 1.0) / 2.0 * torch.log1p((t ** 2) / df)
+
+    log_pdf = log_norm + log_kernel
+    nll = -log_pdf  # Negative log-likelihood
+
+    return nll  # shape 그대로 (B, H, D)
+
+
+def evaluate_student_t_nll(
+    model_path, X, Y, C,
+    latent_dim, cond_dim, hidden, H, beta,
+    device="cuda"
+):
+    """
+    Decoder가 return mean, dist 형태일 때 맞는 Student-t NLL 평가 함수.
+    dist는 torch.distributions.StudentT 객체이어야 한다.
+    """
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_dim = X.shape[-1]
+
+    # 모델 로드
+    encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
+    decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
+    prior   = ConditionalPrior(cond_dim, latent_dim, hidden).to(device)
+
+    model = TimeVAE(encoder, decoder, prior, latent_dim, beta).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    nll_list = []
+
+    with torch.no_grad():
+        for i in range(len(X)):
+
+            x = torch.tensor(X[i:i+1]).float().to(device)     # (1, L, D)
+            y = torch.tensor(Y[i:i+1]).float().to(device)     # (1, H, D)
+            c = torch.tensor(C[i:i+1]).float().to(device)     # (1, cond_dim)
+
+            # posterior mean 사용
+            mu_q, logvar_q = model.encoder(x, c)
+            z = mu_q
+
+            # 디코더: mean, dist 반환
+            mean, dist = model.decoder(z, c)
+
+            # dist는 torch.distributions.StudentT 객체
+            # → dist.log_prob(y)는 (1, H, D)
+            log_pdf = dist.log_prob(y)
+
+            # Negative Log Likelihood = -log p(y|z,c)
+            nll = -log_pdf
+
+            # sample 하나에 대해 모든 H,D 평균
+            nll_mean = nll.mean().item()
+            nll_list.append(nll_mean)
+
+    nll_arr = np.array(nll_list)
+
+    return {
+        "NLL_mean": float(nll_arr.mean()),
+        "NLL_std": float(nll_arr.std()),
+        "NLL_per_sample": nll_arr,
+    }
+
+
+
+# ===============================
+# Scenario-based Risk Metrics
+# ===============================
+
+def compute_risk_metrics(
+    scenario_samples,
+    current_level,
+    feature_index=0,
+    horizon_idx=-1,
+    tail_threshold=-0.1,  # -10% 이하 하락
+    alpha=0.10            # 10% VaR, ES
+):
+    """
+    scenario_samples: (num_samples, H, D)
+    current_level: scalar (현재 Export 수준) 또는 같은 스케일의 값
+    feature_index: 평가할 feature index
+    horizon_idx: 어느 horizon을 볼지 (기본 -1: 마지막)
+    tail_threshold: e.g., -0.1 => -10% 이하 하락
+    alpha: VaR, ES의 신뢰수준(0.1 => 10%)
+    """
+    scenario_samples = np.array(scenario_samples)  # (M,H,D)
+    M, H, D = scenario_samples.shape
+
+    future = scenario_samples[:, horizon_idx, feature_index]  # (M,)
+
+    # 수익률 or 변화율: (future - current) / current
+    # (데이터 스케일에 따라 조정 가능)
+    ret = (future - current_level) / current_level
+
+    # 상승 확률
+    p_up = np.mean(ret > 0)
+
+    # Tail Risk (P(ret < -x%))
+    p_tail = np.mean(ret < tail_threshold)
+
+    # VaR_α, ES_α (하단 tail)
+    var_alpha = np.quantile(ret, alpha)
+    es_alpha = ret[ret <= var_alpha].mean() if np.any(ret <= var_alpha) else var_alpha
+
+    return {
+        "P_up": p_up,
+        f"P_tail(<{tail_threshold*100:.1f}%)": p_tail,
+        f"VaR_{int(alpha*100)}%": var_alpha,
+        f"ES_{int(alpha*100)}%": es_alpha,
+    }
+
+
+
+# ===============================
+# Ablation Utilities
+# ===============================
+
+def compare_models_point_forecast(
+    model_paths,
+    X, Y, C,
+    latent_dim, cond_dim, hidden, H, beta,
+    device="cuda"
+):
+    """
+    model_paths: dict, 예) {
+        "StudentT_withPrior_FiLM": "ckpt/st_t_prior_film.pth",
+        "Gaussian_noPrior_PlainTCN": "ckpt/gauss_no_prior_plain.pth",
+        ...
+    }
+    각 모델에 대해 MSE/MAE/RMSE 계산해서 dict로 반환
+    """
+    results = {}
+
+    for name, path in model_paths.items():
+        preds, trues, _ = evaluate_model(
+            path, X, Y, C,
+            latent_dim, cond_dim, hidden, H, beta,
+            device=device
+        )
+        metrics = compute_point_forecast_metrics(preds, trues)
+        results[name] = metrics
+
+    return results
+
+
+def compare_models_probabilistic_nll(
+    model_paths,
+    X, Y, C,
+    latent_dim, cond_dim, hidden, H, beta,
+    device="cuda",
+    distribution="student_t"
+):
+    results = {}
+
+    for name, path in model_paths.items():
+        metrics = evaluate_student_t_nll(
+            path, X, Y, C,
+            latent_dim, cond_dim, hidden, H, beta,
+            device=device,
+            distribution=distribution
+        )
+        results[name] = metrics
+
+    return results
