@@ -6,22 +6,64 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import math
 
 from model import Encoder, Decoder, ConditionalPrior, TimeVAE
+from macro_pretrain import MacroEncoder
 
 
 # -------------------------------
 # Evaluation (Posterior Reconstruction)
 # -------------------------------
-def evaluate_model(model_path, X, Y, C, latent_dim, cond_dim, hidden, H, beta, device):
+def evaluate_model(
+    model_path, X, Y, C,
+    latent_dim, cond_dim, hidden, H,
+    beta, macro_feature_indices,
+    macro_hidden_dim, macro_latent_dim,
+    device="cuda"
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dim = X.shape[-1]
+    # -------------------------
+    # 1) macro encoder
+    # -------------------------
+    macro_input_dim = len(macro_feature_indices)
+    macro_encoder = MacroEncoder(
+        input_dim=macro_input_dim,
+        hidden_dim=macro_hidden_dim,
+        latent_dim=macro_latent_dim
+    ).to(device)
 
+    macro_encoder.load_state_dict(torch.load("macro_encoder.pth", map_location=device))
+    macro_encoder.eval()
+    for p in macro_encoder.parameters():
+        p.requires_grad = False
+
+    # -------------------------
+    # 2) TimeVAE 구조 (train 과 동일)
+    # -------------------------
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior = ConditionalPrior(cond_dim, latent_dim, hidden).to(device)
 
-    model = TimeVAE(encoder, decoder, prior, latent_dim, beta).to(device)
+    prior = ConditionalPrior(
+        cond_dim=cond_dim,
+        macro_latent_dim=macro_latent_dim,
+        latent_dim=latent_dim,
+        hidden=hidden
+    ).to(device)
+
+    model = TimeVAE(
+        encoder=encoder,
+        decoder=decoder,
+        prior=prior,
+        macro_encoder=macro_encoder,
+        latent_dim=latent_dim,
+        beta=beta
+    ).to(device)
+
+    # -------------------------
+    # 3) Load trained weights
+    # -------------------------
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -30,13 +72,21 @@ def evaluate_model(model_path, X, Y, C, latent_dim, cond_dim, hidden, H, beta, d
     with torch.no_grad():
         for i in range(len(X)):
             x = torch.tensor(X[i:i+1]).float().to(device)
-            y = torch.tensor(Y[i:i+1]).float().to(device)
             c = torch.tensor(C[i:i+1]).float().to(device)
+            y_true = torch.tensor(Y[i:i+1]).float().to(device)
+
+            macro_x = x[:, :, macro_feature_indices].permute(0, 2, 1)
+
+            # (posterior mean 사용)
+            loss, recon, kl, mean, _, _ = model(
+                x, c, macro_x,
+                y=y_true,
+                use_prior_sampling_if_no_y=False
+            )
 
             # 학습 모드와 동일하게 posterior를 써서 reconstruction
-            loss, recon, kl, mean, _ = model(x, c, y)
             preds.append(mean.cpu().numpy())
-            trues.append(y.cpu().numpy())
+            trues.append(y_true.cpu().numpy())
 
     preds = np.concatenate(preds)
     trues = np.concatenate(trues)
@@ -50,9 +100,13 @@ def evaluate_model(model_path, X, Y, C, latent_dim, cond_dim, hidden, H, beta, d
 # Scenario Sampling Near Posterior Anchor
 # -------------------------------
 def scenario_predict_local(
-    model_path, X_last, cond_true, cond_scenario,
+    model_path,
+    X_last, cond_true, cond_scenario,
     latent_dim, cond_dim, hidden, H, beta,
-    num_samples=30, z_shrink=0.1, device="cuda"
+    num_samples, z_shrink,
+    macro_feature_indices,
+    macro_hidden_dim, macro_latent_dim,
+    device="cuda"
 ):
     """
     posterior q(z|x,c_true)를 anchor로 쓰고,
@@ -62,37 +116,60 @@ def scenario_predict_local(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dim = X_last.shape[-1]
 
+     # -------------------------
+    # 1) macro encoder
+    # -------------------------
+    macro_input_dim = len(macro_feature_indices)
+
+    macro_encoder = MacroEncoder(
+        input_dim=macro_input_dim,
+        hidden_dim=macro_hidden_dim,
+        latent_dim=macro_latent_dim
+    ).to(device)
+
+    macro_encoder.load_state_dict(torch.load("macro_encoder.pth", map_location=device))
+    macro_encoder.eval()
+    for p in macro_encoder.parameters():
+        p.requires_grad = False
+
+    # -------------------------
+    # 2) TimeVAE 구성 (train과 동일)
+    # -------------------------
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior = ConditionalPrior(cond_dim, latent_dim, hidden).to(device)
 
-    model = TimeVAE(encoder, decoder, prior, latent_dim, beta).to(device)
+    prior = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
+
+    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    X_t = torch.tensor(X_last).float().unsqueeze(0).to(device)
-    C_true = torch.tensor(cond_true).float().unsqueeze(0).to(device)
-    C_scen = torch.tensor(cond_scenario).float().unsqueeze(0).to(device)
+    # -------------------------
+    # 4) Prepare inputs
+    # -------------------------
+    X_t = torch.tensor(X_last[None]).float().to(device)      # (1,L,D)
+    C_t = torch.tensor(cond_true[None]).float().to(device)   # (1,cond_dim)
+    C_s = torch.tensor(cond_scenario[None]).float().to(device)
+    macro_x = X_t[:, :, macro_feature_indices].permute(0,2,1)
 
     with torch.no_grad():
-        # 1) posterior q(z | x_last, c_true) 계산
-        mu_q, logvar_q = model.encoder(X_t, C_true)# (1, latent_dim)
+        mu_q, logvar_q = model.encoder(X_t, C_t)
+        std_q = torch.exp(0.5 * logvar_q)
 
-        # 2) posterior mean을 anchor로 사용
-        z_base = mu_q # (1, latent_dim)
+    samples = []
 
-        # 3) z 분산을 줄여서 truth 근처에서만 샘플
-        std_q = torch.exp(0.5 * logvar_q) * z_shrink
-
-        samples = []
+    with torch.no_grad():
         for _ in range(num_samples):
             eps = torch.randn_like(std_q)
-            z = z_base + eps * std_q
+            z = mu_q + z_shrink * std_q * eps   # posterior 주변
 
-            mean, _ = model.decoder(z, C_scen) # (1,H,D)
-            samples.append(mean.cpu().numpy()[0])
+            mean_scen, dist_scen = model.decoder(z, C_s)
+            # ★ 여기서 mean 대신 Student-t에서 샘플
+            y_scen = dist_scen.rsample()        # (1,H,D)
 
-    return np.array(samples)
+            samples.append(y_scen.squeeze(0).cpu().numpy())   # (H,D)
+
+    return np.stack(samples, axis=0)   # (num_samples, H, D)
 
 
 # -------------------------------
@@ -100,6 +177,8 @@ def scenario_predict_local(
 # -------------------------------
 def plot_fanchart(true_seq, pred_seq, scenario_samples, feature_index=0):
     scenario_samples = np.array(scenario_samples)
+    scenario_samples = scenario_samples.squeeze()  
+
     lower = np.percentile(scenario_samples[:, :, feature_index], 10, axis=0)
     median = np.percentile(scenario_samples[:, :, feature_index], 50, axis=0)
     upper = np.percentile(scenario_samples[:, :, feature_index], 90, axis=0)
@@ -128,7 +207,7 @@ def plot_fanchart_long(true_seq_full,
     history : 몇 개의 실제 과거 데이터 보여줄지
     """
 
-    scenario_samples = np.array(scenario_samples)
+    scenario_samples = np.array(scenario_samples).squeeze()
     lower = np.percentile(scenario_samples[:, :, feature_index], 10, axis=0)
     median = np.percentile(scenario_samples[:, :, feature_index], 50, axis=0)
     upper = np.percentile(scenario_samples[:, :, feature_index], 90, axis=0)
@@ -162,19 +241,34 @@ def plot_fanchart_long(true_seq_full,
     plt.legend()
     plt.show()
 
+
+
+
+
 def rolling_posterior_forecast(
     model_path, X, C,
     latent_dim, cond_dim, hidden, H, beta,
+    macro_feature_indices,
+    macro_hidden_dim, macro_latent_dim,
     device="cuda"
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dim = X.shape[-1]
 
+    macro_input_dim = len(macro_feature_indices)
+    macro_encoder = MacroEncoder(
+        input_dim=macro_input_dim,
+        hidden_dim=macro_hidden_dim,
+        latent_dim=macro_latent_dim
+    ).to(device)
+    macro_encoder.load_state_dict(torch.load("macro_encoder.pth", map_location=device))
+    macro_encoder.eval()
+
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior = ConditionalPrior(cond_dim, latent_dim, hidden).to(device)
+    prior   = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
 
-    model = TimeVAE(encoder, decoder, prior, latent_dim, beta).to(device)
+    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -185,45 +279,75 @@ def rolling_posterior_forecast(
             x = torch.tensor(X[t:t+1]).float().to(device)
             c = torch.tensor(C[t:t+1]).float().to(device)
 
+            macro_x = x[:, :, macro_feature_indices].permute(0,2,1)
+
+            # posterior mean
             mu_q, logvar_q = model.encoder(x, c)
-            z = mu_q
-            mean, _ = model.decoder(z, c)
+            mean, _ = model.decoder(mu_q, c)
 
-            preds.append(mean.cpu().numpy()[0, 0, :])
+            preds.append(mean[0,0,:].cpu().numpy())
 
-    return np.array(preds)  # (N, D)
+    return np.array(preds)
+
+
+
 
 def posterior_scenario(
     model_path, X_last, C_last,
     latent_dim, cond_dim, hidden, H, beta,
-    num_samples=30, shrink=0.1, device="cuda"
+    macro_feature_indices,
+    macro_hidden_dim, macro_latent_dim,
+    num_samples=30, shrink=0.2,
+    device="cuda"
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dim = X_last.shape[-1]
 
+    macro_input_dim = len(macro_feature_indices)
+    macro_encoder = MacroEncoder(
+        input_dim=macro_input_dim,
+        hidden_dim=macro_hidden_dim,
+        latent_dim=macro_latent_dim
+    ).to(device)
+    macro_encoder.load_state_dict(torch.load("macro_encoder.pth", map_location=device))
+    macro_encoder.eval()
+    for p in macro_encoder.parameters():
+        p.requires_grad = False
+
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior = ConditionalPrior(cond_dim, latent_dim, hidden).to(device)
+    prior   = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
 
-    model = TimeVAE(encoder, decoder, prior, latent_dim, beta).to(device)
+    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    X_t = torch.tensor(X_last).float().unsqueeze(0).to(device)
-    C_t = torch.tensor(C_last).float().unsqueeze(0).to(device)
+    X_t = torch.tensor(X_last[None]).float().to(device)
+    C_t = torch.tensor(C_last[None]).float().to(device)
+    macro_x = X_t[:, :, macro_feature_indices].permute(0,2,1)
 
     with torch.no_grad():
         mu_q, logvar_q = model.encoder(X_t, C_t)
-        std = torch.exp(0.5 * logvar_q) * shrink
+        std_q = torch.exp(0.5 * logvar_q)
 
-        samples = []
+    samples = []
+
+    with torch.no_grad():
         for _ in range(num_samples):
-            eps = torch.randn_like(std)
-            z = mu_q + eps * std
-            mean, _ = model.decoder(z, C_t)
-            samples.append(mean.cpu().numpy()[0])
+            eps = torch.randn_like(std_q)
+            z = mu_q + shrink * std_q * eps
 
-    return np.array(samples)
+            mean, _ = model.decoder(z, C_t)
+            samples.append(mean.squeeze(0).cpu().numpy())
+
+    return np.stack(samples, axis=0)
+
+
+
+
+
+
+
 def plot_full_forecast_and_scenario(
     true_full,
     forecast_full,
@@ -239,9 +363,9 @@ def plot_full_forecast_and_scenario(
     t = np.arange(N)
 
     # Scenario percentiles
-    lower = np.percentile(scenario_samples[:, :, feature_index], 10, axis=0)
-    median = np.percentile(scenario_samples[:, :, feature_index], 50, axis=0)
-    upper = np.percentile(scenario_samples[:, :, feature_index], 90, axis=0)
+    lower = np.percentile(scenario_samples[:, :, feature_index], 10, axis=0).squeeze()
+    median = np.percentile(scenario_samples[:, :, feature_index], 50, axis=0).squeeze()
+    upper = np.percentile(scenario_samples[:, :, feature_index], 90, axis=0).squeeze()
 
     t_future = np.arange(N, N + H)
 
@@ -261,6 +385,7 @@ def plot_full_forecast_and_scenario(
     plt.grid(True)
     plt.legend()
     plt.show()
+
 
 
 
@@ -353,6 +478,10 @@ def compute_crps_from_samples(scenario_samples, true_future, feature_index=0):
     true_future:      (H, D)
     """
     S = np.array(scenario_samples)[:, :, feature_index]  # (M, H)
+    S = np.squeeze(S)
+    if S.ndim > 2:
+        S = S.reshape(S.shape[0], -1)
+
     y = np.array(true_future)[:, feature_index]          # (H,)
 
     M, H = S.shape
@@ -411,54 +540,55 @@ def student_t_nll_torch(y, mean, scale, df, eps=1e-6):
     return nll  # shape 그대로 (B, H, D)
 
 
+
+
 def evaluate_student_t_nll(
     model_path, X, Y, C,
     latent_dim, cond_dim, hidden, H, beta,
     device="cuda"
 ):
-    """
-    Decoder가 return mean, dist 형태일 때 맞는 Student-t NLL 평가 함수.
-    dist는 torch.distributions.StudentT 객체이어야 한다.
-    """
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
     out_dim = X.shape[-1]
 
-    # 모델 로드
+    # ===== model load =====
+    macro_encoder = MacroEncoder(6, 128, 32).to(device)
+    macro_encoder.load_state_dict(torch.load("macro_encoder.pth"))
+    macro_encoder.eval()
+
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior   = ConditionalPrior(cond_dim, latent_dim, hidden).to(device)
+    prior   = ConditionalPrior(cond_dim, 32, latent_dim, hidden).to(device)
 
-    model = TimeVAE(encoder, decoder, prior, latent_dim, beta).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
+    model.load_state_dict(torch.load(model_path))
     model.eval()
 
+    # =======================
     nll_list = []
 
     with torch.no_grad():
         for i in range(len(X)):
 
-            x = torch.tensor(X[i:i+1]).float().to(device)     # (1, L, D)
-            y = torch.tensor(Y[i:i+1]).float().to(device)     # (1, H, D)
-            c = torch.tensor(C[i:i+1]).float().to(device)     # (1, cond_dim)
+            x = torch.tensor(X[i:i+1]).float().to(device)
+            y = torch.tensor(Y[i:i+1]).float().to(device)
+            c = torch.tensor(C[i:i+1]).float().to(device)
 
-            # posterior mean 사용
+            # macro latent
+            macro_x = x[:, :, :6].permute(0, 2, 1)
+            z_macro = macro_encoder(macro_x)
+
+            # posterior mean
             mu_q, logvar_q = model.encoder(x, c)
             z = mu_q
 
-            # 디코더: mean, dist 반환
+            # decoder already produces StudentT
             mean, dist = model.decoder(z, c)
 
-            # dist는 torch.distributions.StudentT 객체
-            # → dist.log_prob(y)는 (1, H, D)
             log_pdf = dist.log_prob(y)
+            nll = -log_pdf.mean().item()
 
-            # Negative Log Likelihood = -log p(y|z,c)
-            nll = -log_pdf
-
-            # sample 하나에 대해 모든 H,D 평균
-            nll_mean = nll.mean().item()
-            nll_list.append(nll_mean)
+            nll_list.append(nll)
 
     nll_arr = np.array(nll_list)
 
@@ -470,51 +600,63 @@ def evaluate_student_t_nll(
 
 
 
+
+
+
+
+
+
+
+
+
 # ===============================
 # Scenario-based Risk Metrics
 # ===============================
 
 def compute_risk_metrics(
     scenario_samples,
-    current_level,
+    current_level_scaled,
+    scaler,
     feature_index=0,
     horizon_idx=-1,
-    tail_threshold=-0.1,  # -10% 이하 하락
-    alpha=0.10            # 10% VaR, ES
+    tail_threshold_raw=-0.1,  # -10% in raw %
+    alpha=0.10
 ):
-    """
-    scenario_samples: (num_samples, H, D)
-    current_level: scalar (현재 Export 수준) 또는 같은 스케일의 값
-    feature_index: 평가할 feature index
-    horizon_idx: 어느 horizon을 볼지 (기본 -1: 마지막)
-    tail_threshold: e.g., -0.1 => -10% 이하 하락
-    alpha: VaR, ES의 신뢰수준(0.1 => 10%)
-    """
-    scenario_samples = np.array(scenario_samples)  # (M,H,D)
+    scenario_samples = np.array(scenario_samples)
     M, H, D = scenario_samples.shape
 
-    future = scenario_samples[:, horizon_idx, feature_index]  # (M,)
+    # ----- 1) scaled → raw 복구 -----
+    future_scaled = scenario_samples[:, horizon_idx, :]  # (M, D)
+    future_raw = scaler.inverse_transform(future_scaled)[:, feature_index]
 
-    # 수익률 or 변화율: (future - current) / current
-    # (데이터 스케일에 따라 조정 가능)
-    ret = (future - current_level) / current_level
+    current_raw = scaler.inverse_transform(
+        np.array(current_level_scaled).reshape(1, -1)
+    )[0, feature_index]
 
-    # 상승 확률
+    # ----- 2) returns -----
+    ret = (future_raw - current_raw) / current_raw
+
+    # ---- 3) metrics ----
     p_up = np.mean(ret > 0)
+    p_tail = np.mean(ret < tail_threshold_raw)
 
-    # Tail Risk (P(ret < -x%))
-    p_tail = np.mean(ret < tail_threshold)
-
-    # VaR_α, ES_α (하단 tail)
+    # VaR
     var_alpha = np.quantile(ret, alpha)
-    es_alpha = ret[ret <= var_alpha].mean() if np.any(ret <= var_alpha) else var_alpha
+
+    # ES (robust version)
+    tail = ret[ret <= var_alpha]
+    if len(tail) < 3:
+        es_alpha = var_alpha
+    else:
+        es_alpha = tail.mean()
 
     return {
         "P_up": p_up,
-        f"P_tail(<{tail_threshold*100:.1f}%)": p_tail,
+        f"P_tail(<{tail_threshold_raw*100:.1f}%)": p_tail,
         f"VaR_{int(alpha*100)}%": var_alpha,
         f"ES_{int(alpha*100)}%": es_alpha,
     }
+
 
 
 
@@ -522,50 +664,127 @@ def compute_risk_metrics(
 # Ablation Utilities
 # ===============================
 
+
 def compare_models_point_forecast(
     model_paths,
     X, Y, C,
     latent_dim, cond_dim, hidden, H, beta,
+    macro_feature_indices,
+    macro_hidden_dim,
+    macro_latent_dim,
     device="cuda"
 ):
-    """
-    model_paths: dict, 예) {
-        "StudentT_withPrior_FiLM": "ckpt/st_t_prior_film.pth",
-        "Gaussian_noPrior_PlainTCN": "ckpt/gauss_no_prior_plain.pth",
-        ...
-    }
-    각 모델에 대해 MSE/MAE/RMSE 계산해서 dict로 반환
-    """
     results = {}
 
     for name, path in model_paths.items():
+        print(f"\n[Point Forecast] Evaluating {name}")
+
         preds, trues, _ = evaluate_model(
-            path, X, Y, C,
-            latent_dim, cond_dim, hidden, H, beta,
+            model_path=path,
+            X=X, Y=Y, C=C,
+            latent_dim=latent_dim,
+            cond_dim=cond_dim,
+            hidden=hidden,
+            H=H,
+            beta=beta,
+            macro_feature_indices=macro_feature_indices,
+            macro_hidden_dim=macro_hidden_dim,
+            macro_latent_dim=macro_latent_dim,
             device=device
         )
+
         metrics = compute_point_forecast_metrics(preds, trues)
         results[name] = metrics
 
     return results
 
 
+
+
 def compare_models_probabilistic_nll(
     model_paths,
     X, Y, C,
     latent_dim, cond_dim, hidden, H, beta,
+    macro_feature_indices,
+    macro_hidden_dim,
+    macro_latent_dim,
     device="cuda",
-    distribution="student_t"
 ):
     results = {}
 
     for name, path in model_paths.items():
+        print(f"\n[Probabilistic NLL] Evaluating {name}")
+
         metrics = evaluate_student_t_nll(
-            path, X, Y, C,
-            latent_dim, cond_dim, hidden, H, beta,
-            device=device,
-            distribution=distribution
+            model_path=path,
+            X=X, Y=Y, C=C,
+            latent_dim=latent_dim,
+            cond_dim=cond_dim,
+            hidden=hidden,
+            H=H,
+            beta=beta,
+            device=device
         )
+
         results[name] = metrics
 
     return results
+
+
+
+
+def run_ablation(
+    X, Y, C,
+    latent_dim, cond_dim, hidden, H, beta,
+    macro_feature_indices,
+    macro_hidden_dim,
+    macro_latent_dim,
+    device="cuda"
+):
+    print("\n\n======================")
+    print("ABALTION: Point Forecast")
+    print("======================\n")
+
+    point_results = compare_models_point_forecast(
+        model_paths=ablation_model_paths,
+        X=X, Y=Y, C=C,
+        latent_dim=latent_dim,
+        cond_dim=cond_dim,
+        hidden=hidden,
+        H=H, beta=beta,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=macro_hidden_dim,
+        macro_latent_dim=macro_latent_dim,
+        device=device
+    )
+
+    for name, metrics in point_results.items():
+        print(f"\n=== {name} ===")
+        print(f"MSE : {metrics['MSE']:.4f}")
+        print(f"MAE : {metrics['MAE']:.4f}")
+        print(f"RMSE: {metrics['RMSE']:.4f}")
+
+
+    print("\n\n======================")
+    print("ABALTION: Probabilistic NLL")
+    print("======================\n")
+
+    prob_results = compare_models_probabilistic_nll(
+        model_paths=ablation_model_paths,
+        X=X, Y=Y, C=C,
+        latent_dim=latent_dim,
+        cond_dim=cond_dim,
+        hidden=hidden,
+        H=H, beta=beta,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=macro_hidden_dim,
+        macro_latent_dim=macro_latent_dim,
+        device=device
+    )
+
+    for name, metrics in prob_results.items():
+        print(f"\n=== {name} ===")
+        print(f"NLL_mean = {metrics['NLL_mean']:.4f}")
+        print(f"NLL_std  = {metrics['NLL_std']:.4f}")
+
+    return point_results, prob_results

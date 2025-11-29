@@ -28,7 +28,8 @@ from scenario_eval import (
     evaluate_student_t_nll,
     compute_risk_metrics,
     compare_models_point_forecast,
-    compare_models_probabilistic_nll
+    compare_models_probabilistic_nll,
+    run_ablation
 
 )
 
@@ -39,6 +40,7 @@ L = 36
 H = 12
 
 LATENT_DIM = 32
+
 COND_DIM = 5
 HIDDEN = 128
 
@@ -47,24 +49,32 @@ N_FOURIER = 3
 
 BETA = 1.0
 LR = 1e-3
-EPOCHS = 80          # rolling forward 재학습 시 epoch 많으면 오래 걸림
+EPOCHS = 150         # rolling forward 재학습 시 epoch 많으면 오래 걸림
 BATCH_SIZE = 32
 
 DEVICE = "cuda"
 
-
+MACRO_HIDDEN_DIM = 128  # macro encoder hidden dim
+MACRO_LATENT_DIM = 32   # macro encoder latent dim
 # -------------------------------
 # Condition columns (raw)
 # -------------------------------
 condition_raw_cols = [
     "Exchange Rate",
     "CAPEX",
-    "Global Manufacturing PMI",
-    "OECD CLI",
-    "U.S. ISM Manufacturing New Orders Index",
+    "PMI",
+    "CLI",
+    "ISM",
 ]
 
-
+MACRO_COLS = [
+    "PMI",
+    "GS10",
+    "M2SL",
+    "UNRATE",
+    "CPIAUCSL",
+    "INDPRO",
+]
 # ===========================================
 # Main
 # ===========================================
@@ -72,11 +82,13 @@ if __name__ == "__main__":
 
     print("========== 1) Preprocessing ==========")
 
-    X, Y, C, scaler, df_raw, df_scaled = preprocess(
-        "data.csv",
-        condition_raw_cols,
-        L,
-        H
+    X, Y, C, scaler, df_raw, df_scaled, macro_feature_indices = preprocess(
+        csv_path="data.csv",
+        macro_csv_path="macro.csv",
+        condition_raw_cols=condition_raw_cols,
+        macro_cols=MACRO_COLS,
+        L=L,
+        H=H,
     )
 
     print("X:", X.shape, "Y:", Y.shape, "C:", C.shape)
@@ -98,7 +110,8 @@ if __name__ == "__main__":
         lr=LR,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
-        device=DEVICE
+        device=DEVICE,
+        macro_feature_indices=macro_feature_indices,
     )
 
     print("=================================\n")
@@ -107,43 +120,45 @@ if __name__ == "__main__":
     # =======================================
     # 3) Rolling Backtest (고정 모델)
     # =======================================
-    print("========== 3) Rolling Backtest ==========")
+    # print("========== 3) Rolling Backtest ==========")
 
-    mse_back = rolling_backtest(
-        model_path="timevae_ctvae_prior.pth",
-        X=X, Y=Y, C=C,
-        latent_dim=LATENT_DIM,
-        cond_dim=COND_DIM,
-        hidden=HIDDEN,
-        H=H,
-        beta=BETA,
-        device=DEVICE
-    )
+    # mse_back = rolling_backtest(
+    #     model_path="timevae_ctvae_prior.pth",
+    #     X=X, Y=Y, C=C,
+    #     latent_dim=LATENT_DIM,
+    #     cond_dim=COND_DIM,
+    #     hidden=HIDDEN,
+    #     H=H,
+    #     beta=BETA,
+    #     macro_feature_indices=macro_feature_indices,
+    #     device=DEVICE,
+    # )
 
-    print(f"Rolling Backtest MSE: {mse_back:.6f}")
-    print("=================================\n")
+    # print(f"Rolling Backtest MSE: {mse_back:.6f}")
+    # print("=================================\n")
 
 
     # =======================================
     # 4) Rolling Forward Test (매번 재학습)
     # =======================================
-    print("========== 4) Rolling Forward Test ==========")
+    # print("========== 4) Rolling Forward Test ==========")
 
-    mse_forward = rolling_forward_test(
-        X, Y, C,
-        latent_dim=LATENT_DIM,
-        cond_dim=COND_DIM,
-        hidden=HIDDEN,
-        H=H,
-        beta=BETA,
-        lr=LR,
-        epochs=10,              # Rolling forward는 epoch을 줄이지 않으면 너무 오래 걸림
-        batch_size=BATCH_SIZE,
-        device=DEVICE
-    )
+    # mse_forward = rolling_forward_test(
+    #     X, Y, C,
+    #     latent_dim=LATENT_DIM,
+    #     cond_dim=COND_DIM,
+    #     hidden=HIDDEN,
+    #     H=H,
+    #     beta=BETA,
+    #     lr=LR,
+    #     epochs=10,
+    #     batch_size=BATCH_SIZE,
+    #     macro_feature_indices=macro_feature_indices,
+    #     device=DEVICE,
+    # )
 
-    print(f"Rolling Forward Test MSE: {mse_forward:.6f}")
-    print("=================================\n")
+    # print(f"Rolling Forward Test MSE: {mse_forward:.6f}")
+    # print("=================================\n")
 
 
     # =======================================
@@ -159,14 +174,17 @@ if __name__ == "__main__":
         hidden=HIDDEN,
         H=H,
         beta=BETA,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
         device=DEVICE
     )
 
     print(f"Posterior Recon MSE: {mse_eval:.6f}")
     print("=================================\n")
 
-    print(f"Rolling Backtest MSE: {mse_back:.6f}")
-    print(f"Rolling Forward Test MSE: {mse_forward:.6f}")
+    # print(f"Rolling Backtest MSE: {mse_back:.6f}")
+    # print(f"Rolling Forward Test MSE: {mse_forward:.6f}")
     # =======================================
     # 6) Scenario Generation
     # =======================================
@@ -179,11 +197,11 @@ if __name__ == "__main__":
 
     # 시나리오 조건 (RAW 형태)
     scenario_cond_raw = {
-        "Exchange Rate": 1393.41,
-        "CAPEX": 96404.0,
-        "Global Manufacturing PMI": 52.4,
-        "OECD CLI": 100.35,
-        "U.S. ISM Manufacturing New Orders Index": 48.9,
+        "Exchange Rate": 1388.91,
+        "CAPEX": 93163.0,
+        "PMI": 48.0,
+        "CLI": 100.27,
+        "ISM": 51.4,
     }
 
     # raw → scaled 변환
@@ -211,7 +229,10 @@ if __name__ == "__main__":
         H=H,
         beta=BETA,
         num_samples=50,
-        z_shrink=0.1,
+        z_shrink=0.5,
+        macro_feature_indices=macro_feature_indices,   # ★ 추가
+        macro_hidden_dim=MACRO_HIDDEN_DIM,             # ★ 추가
+        macro_latent_dim=MACRO_LATENT_DIM,             # ★ 추가
         device=DEVICE
     )
 
@@ -238,23 +259,27 @@ if __name__ == "__main__":
     )
 
 
-    print("=========== Completed! ===========")
+    print("=========== Completed 1st! ===========")
 
     # 1) Rolling forecast (파란선)
     forecast_full = rolling_posterior_forecast(
         "timevae_ctvae_prior.pth",
-        X, C,
+        X, 
+        C,
         latent_dim=LATENT_DIM,
         cond_dim=COND_DIM,
         hidden=HIDDEN,
         H=H,
         beta=BETA,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
         device=DEVICE
     )
 
     # 2) 마지막 시점 scenario (빨간선)
-    scenario_samples = posterior_scenario(
-        "timevae_ctvae_prior.pth",
+    samples = posterior_scenario(
+        model_path="timevae_ctvae_prior.pth",
         X_last=X[-1],
         C_last=C[-1],
         latent_dim=LATENT_DIM,
@@ -262,25 +287,31 @@ if __name__ == "__main__":
         hidden=HIDDEN,
         H=H,
         beta=BETA,
-        num_samples=50,
-        shrink=0.2,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
+        num_samples=30,
+        shrink=0.1,
         device=DEVICE
     )
-
     # 3) true 전체 시계열 (각 chunk의 첫 y가 true future 1-step)
     true_full = Y[:, 0, :]
 
     # 4) Plot
     plot_full_forecast_and_scenario(
-        true_full=true_full,
-        forecast_full=forecast_full,
-        scenario_samples=scenario_samples,
+        true_full=true_full,            # shape (N, D)
+        forecast_full=forecast_full,    # rolling forecast (N, D)
+        scenario_samples=scenario_samples,  # shape (num_samples, H, D)
         feature_index=0,
         H=H
     )
 
-
     point_metrics  = compute_point_forecast_metrics(preds, trues)
+    print("=========== Completed 2nd! ===========")
+
+    
+
+
     print("=== Point Forecast Metrics ===")
     for k, v in point_metrics.items():
         print(f"{k} : {v}")
@@ -288,7 +319,9 @@ if __name__ == "__main__":
     
     nll_metrics = evaluate_student_t_nll(
         model_path="timevae_ctvae_prior.pth",
-        X=X, Y=Y, C=C,
+        X=X, 
+        Y=Y, 
+        C=C,
         latent_dim=LATENT_DIM,
         cond_dim=COND_DIM,
         hidden=HIDDEN,
@@ -302,6 +335,8 @@ if __name__ == "__main__":
     print("NLL_std :", nll_metrics["NLL_std"])
 
 
+
+
     coverage = compute_coverage_and_sharpness(
         scenario_samples,
         true_future=Y[-1],
@@ -311,7 +346,12 @@ if __name__ == "__main__":
     )
 
     print("=== Coverage / Sharpness ===")
-    print(coverage)
+    for k, v in coverage.items():
+        print(f"{k}: {float(v):.4f}")
+
+
+
+
 
     crps = compute_crps_from_samples(
         scenario_samples,
@@ -320,17 +360,24 @@ if __name__ == "__main__":
     )
 
     print("=== CRPS ===")
-    print(crps)
+    print(f"CRPS_mean: {crps['CRPS_mean']:.4f}")
+    print("CRPS_per_h:", np.round(crps["CRPS_per_h"], 4))
 
-    current_level = X[-1][-1, 0]   # 마지막 시점 export (예: feature 0)
+
+
+
+
+
+    current_level_scaled = X[-1][-1, :]       # Scaled current level
 
     risk = compute_risk_metrics(
-        scenario_samples,
-        current_level=current_level,
-        feature_index=0,
-        horizon_idx=-1,
-        tail_threshold=-0.1,   # -10%
-        alpha=0.10
+        scenario_samples=scenario_samples,
+        current_level_scaled=current_level_scaled,
+        scaler=scaler,
+        feature_index=0,           # export
+        horizon_idx=-1,            # 마지막 horizon
+        tail_threshold_raw=-0.10,  # -10% drop
+        alpha=0.10                 # 10% VaR
     )
 
     print("=== Risk Metrics ===")

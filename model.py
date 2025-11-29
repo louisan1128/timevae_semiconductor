@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import StudentT
 from torch.nn.utils import weight_norm
-
+from macro_pretrain import MacroEncoder
 
 # -------------------------------
 # Condition Layer
@@ -363,18 +363,20 @@ class Decoder(nn.Module):
         return mean, dist
 
 
+
+
 # -------------------------------
 # Conditional Prior
 # -------------------------------
 class ConditionalPrior(nn.Module):
     """
-    p(z | c) = N(mu_p(c), diag(sigma_p(c)^2))
+     p(z | c, z_macro) = N(mu_p(c, z_macro), diag(sigma_p(c, z_macro)^2))
     """
 
-    def __init__(self, cond_dim, latent_dim, hidden=128):
+    def __init__(self, cond_dim, macro_latent_dim, latent_dim, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cond_dim, hidden),
+            nn.Linear(cond_dim + macro_latent_dim, hidden),
             nn.ReLU(),
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden),
@@ -383,22 +385,26 @@ class ConditionalPrior(nn.Module):
         self.mu_head = nn.Linear(hidden, latent_dim)
         self.logvar_head = nn.Linear(hidden, latent_dim)
 
-    def forward(self, c):
-        h = self.net(c)
-        mu_p = self.mu_head(h)
-        logvar_p = self.logvar_head(h)
-        return mu_p, logvar_p
+    def forward(self, c, z_macro):
+        # c: (B, cond_dim)
+        # z_macro: (B, macro_latent_dim)
+        if isinstance(z_macro, tuple):
+            z_macro = z_macro[-1]
+        x = torch.cat([c, z_macro], dim=-1)   # (B, cond_dim + macro_latent_dim)
+        h = self.net(x)
+        return self.mu_head(h), self.logvar_head(h)
 
 
 # -------------------------------
 # Full CT-VAE (TimeVAE)
 # -------------------------------
 class TimeVAE(nn.Module):
-    def __init__(self, encoder, decoder, prior, latent_dim, beta=1.0):
+    def __init__(self, encoder, decoder, prior, macro_encoder, latent_dim, beta=1.0):
         super().__init__()
-        self.encoder = encoder   # q(z|x,c)
-        self.decoder = decoder   # p(x|z,c)
-        self.prior = prior       # p(z|c)
+        self.encoder = encoder       # q(z|x,c)
+        self.decoder = decoder       # p(x|z,c)
+        self.prior = prior           # p(z|c,z_macro)
+        self.macro_encoder = macro_encoder  # frozen encoder for macro series
         self.latent_dim = latent_dim
         self.beta = beta
 
@@ -420,25 +426,33 @@ class TimeVAE(nn.Module):
         )
         return 0.5 * term.sum(dim=-1).mean()
 
-    def forward(self, x, c, y=None, use_prior_sampling_if_no_y=True):
+    def forward(self, x, c, macro_x, y=None, use_prior_sampling_if_no_y=True):
         """
-        x: (B, L, D)
-        c: (B, cond_dim)
-        y: (B, H, D) or None
+        x       : (B, L, D)   전체 반도체+매크로 feature
+        c       : (B, cond_dim)  (예: Exchange, CAPEX, PMI, CLI, ISM)
+        macro_x : (B, macro_dim, L)  (macro feature subset 시계열)
+        y       : (B, H, D) or None
         """
-        # posterior q(z|x,c)
+
+        # 1) posterior q(z|x,c)
         mu_q, logvar_q = self.encoder(x, c)
 
-        # prior p(z|c)
-        mu_p, logvar_p = self.prior(c)
+        # 2) macro latent (frozen encoder)
+        #    MacroEncoder는 (B, macro_dim, L) → (B, macro_latent_dim)
+        z_macro = self.macro_encoder(macro_x)
 
-        # inference-only 모드 (scenario generation)
+        # 3) conditional prior p(z|c, z_macro)
+        mu_p, logvar_p = self.prior(c, z_macro)
+
+        # 4) inference-only 모드 (scenario generation / forecast)
         if (y is None) and use_prior_sampling_if_no_y:
+            # prior에서 샘플링
             z = self.reparameterize(mu_p, logvar_p)
             mean, dist = self.decoder(z, c)
             return mean, z, (mu_p, logvar_p)
+        
 
-        # 학습 모드: q에서 샘플링
+        # 5) 학습 모드: q에서 샘플링
         z = self.reparameterize(mu_q, logvar_q)
         mean, dist = self.decoder(z, c)
 
@@ -450,4 +464,4 @@ class TimeVAE(nn.Module):
         kl_loss = self.kl_gaussian(mu_q, logvar_q, mu_p, logvar_p)
 
         loss = recon_loss + self.beta * kl_loss
-        return loss, recon_loss, kl_loss, mean, z
+        return loss, recon_loss, kl_loss, mean, z, (mu_p, logvar_p)
