@@ -386,21 +386,3 @@ if __name__ == "__main__":
 
 
 
-###################
-    res = rolling_forward_backtest(
-        model_path="timevae.pth",
-        X=X_test, Y=Y_test, C=C_test,
-        latent_dim=latent_dim, cond_dim=cond_dim, hidden=hidden, H=H, beta=beta,
-        macro_feature_indices=macro_feature_indices,
-        macro_hidden_dim=128, macro_latent_dim=32,
-        num_samples=1000,      # CRPS 안정화
-        z_shrink=1.0,          # 평가면 1.0 추천
-        sample_from_student_t=True,
-        seed=0,
-        crps_feature_index=0,  # 예: DRAM index
-    )
-    
-    print(res["RMSE"], res["NLL_mean"], res["CRPS_mean"])
-    print(res["CRPS_per_h"])
-
-
