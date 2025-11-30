@@ -1,5 +1,5 @@
 # ===========================================
-# main.py — 전체 파이프라인 실행 (UPDATED)
+# main.py — 전체 파이프라인 실행 (FIXED for MACRO_X-based scenario_eval.py)
 # ===========================================
 
 import numpy as np
@@ -19,16 +19,45 @@ from scenario_eval import (
     rolling_posterior_forecast,
     plot_full_forecast_and_scenario,
     posterior_scenario,
-
     compute_point_forecast_metrics,
     compute_coverage_and_sharpness,
     compute_crps_from_samples,
     evaluate_student_t_nll,
-    compute_risk_metrics,
-    compare_models_point_forecast,
-    compare_models_probabilistic_nll,
-    run_ablation
 )
+
+# ---- (옵션) risk metric을 scenario_eval 안쓰고 main에서 로컬로 정의 ----
+def compute_risk_metrics(
+    scenario_samples,
+    current_level_scaled,
+    scaler,
+    feature_index=0,
+    horizon_idx=-1,
+    tail_threshold_raw=-0.10,
+    alpha=0.10
+):
+    S = np.array(scenario_samples)  # (M,H,D) scaled
+    future_scaled = S[:, horizon_idx, :]  # (M,D)
+
+    future_raw = scaler.inverse_transform(future_scaled)[:, feature_index]
+    current_raw = scaler.inverse_transform(
+        np.asarray(current_level_scaled).reshape(1, -1)
+    )[0, feature_index]
+
+    ret = (future_raw - current_raw) / (current_raw + 1e-12)
+
+    p_up = float(np.mean(ret > 0))
+    p_tail = float(np.mean(ret < tail_threshold_raw))
+
+    var_alpha = float(np.quantile(ret, alpha))
+    tail = ret[ret <= var_alpha]
+    es_alpha = float(tail.mean()) if len(tail) >= 3 else var_alpha
+
+    return {
+        "P_up": p_up,
+        f"P_tail(<{tail_threshold_raw*100:.1f}%)": p_tail,
+        f"VaR_{int(alpha*100)}%": var_alpha,
+        f"ES_{int(alpha*100)}%": es_alpha,
+    }
 
 
 # -------------------------------
@@ -62,15 +91,13 @@ condition_raw_cols = [
     "ISM",
 ]
 
-# 매크로 전처리(스케일러/변환)와 동일한 feature set을 쓴다는 전제
-# (train preprocess 내부에서 macro_scaler.pkl 기반 변환/컬럼을 맞추도록 되어있어야 함)
-MACRO_FEAT_COLS = [
+MACRO_COLS = [
     "PMI",
     "GS10",
-    "LOG_M2",
+    "M2SL",
     "UNRATE",
-    "INFLATION",
-    "LOG_INDPRO",
+    "CPIAUCSL",
+    "INDPRO",
 ]
 
 # ===========================================
@@ -79,32 +106,31 @@ MACRO_FEAT_COLS = [
 if __name__ == "__main__":
 
     print("========== 1) Preprocessing ==========")
-
-    # preprocess() UPDATED:
-    # - X: (N, L, D)
-    # - Y: (N, H, D)
-    # - C: (N, cond_dim)
-    # - MACRO_X: (N, 6, L)  <-- 중요!
-    X, Y, C, MACRO_X, scaler, df_raw, df_scaled, macro_feat_cols = preprocess(
+    X, Y, C, scaler, df_raw, df_scaled, macro_feature_indices = preprocess(
         csv_path="data.csv",
         macro_csv_path="macro.csv",
         condition_raw_cols=condition_raw_cols,
-        macro_feat_cols=MACRO_FEAT_COLS,
+        macro_cols=MACRO_COLS,
         L=L,
         H=H,
     )
+    print("X:", X.shape, "Y:", Y.shape, "C:", C.shape)
 
-    print("X:", X.shape, "Y:", Y.shape, "C:", C.shape, "MACRO_X:", MACRO_X.shape)
-    print("macro_feat_cols:", macro_feat_cols)
+    # ---------------------------------------------------------
+    # 핵심 FIX: scenario_eval.py가 요구하는 MACRO_X를 여기서 구성
+    # X: (N, L, D)
+    # MACRO_X: (N, macro_dim, L)
+    # ---------------------------------------------------------
+    MACRO_X = np.transpose(X[:, :, macro_feature_indices], (0, 2, 1)).astype(np.float32)
+    print("MACRO_X:", MACRO_X.shape)
     print("======================================\n")
 
     # =======================================
     # 2) Train model
     # =======================================
     print("========== 2) Training ==========")
-
     model = train_model(
-        X, Y, C, MACRO_X,
+        X, Y, C,
         latent_dim=LATENT_DIM,
         cond_dim=COND_DIM,
         hidden=HIDDEN,
@@ -114,56 +140,14 @@ if __name__ == "__main__":
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         device=DEVICE,
-        macro_hidden_dim=MACRO_HIDDEN_DIM,
-        macro_latent_dim=MACRO_LATENT_DIM,
+        macro_feature_indices=macro_feature_indices,  # train_model은 여전히 indices 방식
     )
-
     print("=================================\n")
 
     # =======================================
-    # 3) Rolling Backtest (optional)
+    # 3) Posterior Evaluation
     # =======================================
-    # print("========== 3) Rolling Backtest ==========")
-    # mse_back = rolling_backtest(
-    #     model_path="timevae_ctvae_prior.pth",
-    #     X=X, Y=Y, C=C, MACRO_X=MACRO_X,
-    #     latent_dim=LATENT_DIM,
-    #     cond_dim=COND_DIM,
-    #     hidden=HIDDEN,
-    #     H=H,
-    #     beta=BETA,
-    #     macro_hidden_dim=MACRO_HIDDEN_DIM,
-    #     macro_latent_dim=MACRO_LATENT_DIM,
-    #     device=DEVICE,
-    # )
-    # print(f"Rolling Backtest MSE: {mse_back:.6f}")
-    # print("=================================\n")
-
-    # =======================================
-    # 4) Rolling Forward Test (optional)
-    # =======================================
-    # print("========== 4) Rolling Forward Test ==========")
-    # mse_forward = rolling_forward_test(
-    #     X=X, Y=Y, C=C, MACRO_X=MACRO_X,
-    #     latent_dim=LATENT_DIM,
-    #     cond_dim=COND_DIM,
-    #     hidden=HIDDEN,
-    #     H=H,
-    #     beta=BETA,
-    #     lr=LR,
-    #     epochs=10,
-    #     batch_size=BATCH_SIZE,
-    #     macro_hidden_dim=MACRO_HIDDEN_DIM,
-    #     macro_latent_dim=MACRO_LATENT_DIM,
-    #     device=DEVICE,
-    # )
-    # print(f"Rolling Forward Test MSE: {mse_forward:.6f}")
-    # print("=================================\n")
-
-    # =======================================
-    # 5) Posterior Evaluation
-    # =======================================
-    print("========== 5) Posterior Evaluation ==========")
+    print("========== 3) Posterior Evaluation ==========")
 
     preds, trues, mse_eval = evaluate_model(
         model_path="timevae_ctvae_prior.pth",
@@ -182,16 +166,14 @@ if __name__ == "__main__":
     print("=================================\n")
 
     # =======================================
-    # 6) Scenario Generation
+    # 4) Scenario Generation
     # =======================================
-    print("========== 6) Scenario Forecasting ==========")
+    print("========== 4) Scenario Forecasting ==========")
 
-    # 마지막 관측 RAW 값 (condition/feature 편집에 사용)
     last_truth_raw = df_raw.iloc[-1]
     print("===== Last RAW sample =====")
     print(last_truth_raw)
 
-    # 시나리오 조건 (RAW 형태)
     scenario_cond_raw = {
         "Exchange Rate": 1388.91,
         "CAPEX": 93163.0,
@@ -200,25 +182,23 @@ if __name__ == "__main__":
         "ISM": 51.4,
     }
 
-    # raw → scaled 변환(전체 feature 벡터 만들기)
-    full_raw_vec = [
+    # raw → scaled (전체 feature 벡터 길이 D로 맞춰야 scaler가 먹음)
+    full_raw = [
         scenario_cond_raw[col] if col in scenario_cond_raw else last_truth_raw[col]
-        for col in df_raw.columns
+        for col in df_raw.index  # df_raw는 Series니까 index가 column list 역할
     ]
-    scaled_full = scaler.transform([full_raw_vec])[0]
+    scaled_full = scaler.transform([full_raw])[0]
 
-    # condition만 추출
     scenario_cond_scaled = np.array([
-        scaled_full[df_raw.columns.get_loc(col)]
+        scaled_full[list(df_raw.index).index(col)]
         for col in condition_raw_cols
     ], dtype=np.float32)
 
-    # === scenario sampling ===
     scenario_samples = scenario_predict_local(
         model_path="timevae_ctvae_prior.pth",
-        X_last=X[-1],                      # (L,D)
-        macro_x_last=MACRO_X[-1],          # (6,L)  <-- 중요!
-        cond_true=C[-1],                   # (cond_dim,)
+        X_last=X[-1],
+        macro_x_last=MACRO_X[-1],
+        cond_true=C[-1],
         cond_scenario=scenario_cond_scaled,
         latent_dim=LATENT_DIM,
         cond_dim=COND_DIM,
@@ -234,9 +214,9 @@ if __name__ == "__main__":
     )
 
     # =======================================
-    # 7) Fan Chart 출력
+    # 5) Fan Chart 출력
     # =======================================
-    print("========== 7) Plotting Fan Chart ==========")
+    print("========== 5) Plotting Fan Chart ==========")
 
     plot_fanchart(
         true_seq=trues[-1],
@@ -253,11 +233,13 @@ if __name__ == "__main__":
         history=60
     )
 
-    print("=========== Completed 1st! ===========")
+    print("=========== Completed Fan Chart ===========")
 
-    # 1) Rolling forecast (파란선)
+    # =======================================
+    # 6) Rolling posterior forecast
+    # =======================================
     forecast_full = rolling_posterior_forecast(
-        model_path="timevae_ctvae_prior.pth",
+        "timevae_ctvae_prior.pth",
         X=X,
         C=C,
         MACRO_X=MACRO_X,
@@ -271,7 +253,7 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
-    # 2) 마지막 시점 posterior scenario
+    # 마지막 시점 posterior scenario
     samples_post = posterior_scenario(
         model_path="timevae_ctvae_prior.pth",
         X_last=X[-1],
@@ -289,8 +271,7 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
-    # true 전체 시계열 (각 chunk의 첫 y가 true future 1-step)
-    true_full = Y[:, 0, :]
+    true_full = Y[:, 0, :]  # (N, D)
 
     plot_full_forecast_and_scenario(
         true_full=true_full,
@@ -300,10 +281,8 @@ if __name__ == "__main__":
         H=H
     )
 
-    print("=========== Completed 2nd! ===========")
-
     # =======================================
-    # 8) Metrics
+    # 7) Metrics
     # =======================================
     point_metrics = compute_point_forecast_metrics(preds, trues)
     print("=== Point Forecast Metrics ===")
@@ -345,3 +324,18 @@ if __name__ == "__main__":
     print("=== CRPS ===")
     print(f"CRPS_mean: {crps['CRPS_mean']:.4f}")
     print("CRPS_per_h:", np.round(crps["CRPS_per_h"], 4))
+
+    # risk metrics
+    current_level_scaled = X[-1][-1, :]  # (D,)
+    risk = compute_risk_metrics(
+        scenario_samples=scenario_samples,
+        current_level_scaled=current_level_scaled,
+        scaler=scaler,
+        feature_index=0,
+        horizon_idx=-1,
+        tail_threshold_raw=-0.10,
+        alpha=0.10
+    )
+    print("=== Risk Metrics ===")
+    for k, v in risk.items():
+        print(f"{k}: {v}")
