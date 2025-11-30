@@ -319,4 +319,174 @@ def compute_crps_from_samples(scenario_samples, true_future, feature_index=0):
 
     crps_per_h = term1 - 0.5 * term2
     crps = crps_per_h.mean()
-    return {"CRPS
+    return {"CRPS_mean": float(crps), "CRPS_per_h": crps_per_h}
+
+
+def student_t_nll_torch(y, mean, scale, df, eps=1e-6):
+    scale = scale + eps
+    df = df + eps
+    t = (y - mean) / scale
+    log_norm = (
+        torch.lgamma((df + 1.0) / 2.0)
+        - torch.lgamma(df / 2.0)
+        - 0.5 * torch.log(df * math.pi)
+        - torch.log(scale)
+    )
+    log_kernel = - (df + 1.0) / 2.0 * torch.log1p((t ** 2) / df)
+    log_pdf = log_norm + log_kernel
+    return -log_pdf
+
+
+def evaluate_student_t_nll(
+    model_path,
+    X, Y, C, MACRO_X,
+    latent_dim, cond_dim, hidden, H, beta,
+    device="cuda",
+    macro_encoder_path="macro_encoder.pth",
+    macro_hidden_dim=128,
+    macro_latent_dim=32,
+):
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    out_dim = X.shape[-1]
+    macro_input_dim = MACRO_X.shape[1]
+
+    macro_encoder = MacroEncoder(macro_input_dim, macro_hidden_dim, macro_latent_dim).to(device)
+    macro_encoder.load_state_dict(torch.load(macro_encoder_path, map_location=device))
+    macro_encoder.eval()
+    for p in macro_encoder.parameters():
+        p.requires_grad = False
+
+    encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
+    decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
+    prior = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
+
+    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    nll_list = []
+    with torch.no_grad():
+        for i in range(len(X)):
+            x = torch.tensor(X[i:i+1]).float().to(device)
+            y = torch.tensor(Y[i:i+1]).float().to(device)
+            c = torch.tensor(C[i:i+1]).float().to(device)
+
+            mu_q, logvar_q = model.encoder(x, c)
+            mean, dist = model.decoder(mu_q, c)
+            nll = -dist.log_prob(y).mean().item()
+            nll_list.append(nll)
+
+    nll_arr = np.array(nll_list, dtype=float)
+    return {
+        "NLL_mean": float(nll_arr.mean()),
+        "NLL_std": float(nll_arr.std()),
+        "NLL_per_sample": nll_arr,
+    }
+
+
+def compute_risk_metrics(
+    scenario_samples,
+    current_level_scaled,
+    scaler,
+    feature_index=0,
+    horizon_idx=-1,
+    tail_threshold_raw=-0.10,
+    alpha=0.10,
+):
+    S = np.array(scenario_samples)           # (M,H,D)
+    future_scaled = S[:, horizon_idx, :]     # (M,D)
+
+    future_raw = scaler.inverse_transform(future_scaled)[:, feature_index]
+    current_raw = scaler.inverse_transform(np.array(current_level_scaled).reshape(1, -1))[0, feature_index]
+
+    ret = (future_raw - current_raw) / (current_raw + 1e-12)
+
+    p_up = float(np.mean(ret > 0))
+    p_tail = float(np.mean(ret < tail_threshold_raw))
+
+    var_alpha = float(np.quantile(ret, alpha))
+    tail = ret[ret <= var_alpha]
+    es_alpha = float(var_alpha if len(tail) < 3 else tail.mean())
+
+    return {
+        "P_up": p_up,
+        f"P_tail(<{tail_threshold_raw*100:.1f}%)": p_tail,
+        f"VaR_{int(alpha*100)}%": var_alpha,
+        f"ES_{int(alpha*100)}%": es_alpha,
+    }
+
+
+# -------------------------------
+# Ablation helpers (import error 방지용 포함)
+# -------------------------------
+def compare_models_point_forecast(
+    model_paths,
+    X, Y, C, MACRO_X,
+    latent_dim, cond_dim, hidden, H, beta,
+    macro_hidden_dim, macro_latent_dim,
+    device="cuda",
+):
+    results = {}
+    for name, path in model_paths.items():
+        preds, trues, _ = evaluate_model(
+            model_path=path,
+            X=X, Y=Y, C=C, MACRO_X=MACRO_X,
+            latent_dim=latent_dim,
+            cond_dim=cond_dim,
+            hidden=hidden,
+            H=H,
+            beta=beta,
+            macro_hidden_dim=macro_hidden_dim,
+            macro_latent_dim=macro_latent_dim,
+            device=device,
+        )
+        results[name] = compute_point_forecast_metrics(preds, trues)
+    return results
+
+
+def compare_models_probabilistic_nll(
+    model_paths,
+    X, Y, C, MACRO_X,
+    latent_dim, cond_dim, hidden, H, beta,
+    macro_hidden_dim, macro_latent_dim,
+    device="cuda",
+):
+    results = {}
+    for name, path in model_paths.items():
+        results[name] = evaluate_student_t_nll(
+            model_path=path,
+            X=X, Y=Y, C=C, MACRO_X=MACRO_X,
+            latent_dim=latent_dim,
+            cond_dim=cond_dim,
+            hidden=hidden,
+            H=H,
+            beta=beta,
+            device=device,
+            macro_hidden_dim=macro_hidden_dim,
+            macro_latent_dim=macro_latent_dim,
+        )
+    return results
+
+
+def run_ablation(
+    model_paths,
+    X, Y, C, MACRO_X,
+    latent_dim, cond_dim, hidden, H, beta,
+    macro_hidden_dim, macro_latent_dim,
+    device="cuda",
+):
+    point_results = compare_models_point_forecast(
+        model_paths=model_paths,
+        X=X, Y=Y, C=C, MACRO_X=MACRO_X,
+        latent_dim=latent_dim, cond_dim=cond_dim, hidden=hidden, H=H, beta=beta,
+        macro_hidden_dim=macro_hidden_dim, macro_latent_dim=macro_latent_dim,
+        device=device,
+    )
+    prob_results = compare_models_probabilistic_nll(
+        model_paths=model_paths,
+        X=X, Y=Y, C=C, MACRO_X=MACRO_X,
+        latent_dim=latent_dim, cond_dim=cond_dim, hidden=hidden, H=H, beta=beta,
+        macro_hidden_dim=macro_hidden_dim, macro_latent_dim=macro_latent_dim,
+        device=device,
+    )
+    return point_results, prob_results
