@@ -788,3 +788,187 @@ def run_ablation(
         print(f"NLL_std  = {metrics['NLL_std']:.4f}")
 
     return point_results, prob_results
+
+####################eval2
+import random
+import numpy as np
+import torch
+
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def crps_from_samples_fast_1feature(samples_MHD, y_HD, feature_index=0):
+    """
+    samples_MHD: (M,H,D)
+    y_HD:        (H,D)
+    returns: (H,) CRPS per horizon for one feature
+    O(M log M) per horizon (sort 기반) -> M 크게 가능
+    """
+    S = np.asarray(samples_MHD)[:, :, feature_index]  # (M,H)
+    y = np.asarray(y_HD)[:, feature_index]            # (H,)
+    M, H = S.shape
+
+    crps_per_h = np.zeros(H, dtype=float)
+    i = np.arange(1, M + 1, dtype=float)
+
+    for h in range(H):
+        x = np.sort(S[:, h])
+        term1 = np.mean(np.abs(x - y[h]))
+        # mean_{i,j}|xi-xj| = (2/(M^2)) * sum_{k=1..M} (2k-M-1)*x_k
+        sum_abs = 2.0 * np.sum((2.0 * i - M - 1.0) * x)
+        term2 = sum_abs / (M * M)
+        crps_per_h[h] = term1 - 0.5 * term2
+
+    return crps_per_h
+
+def load_timevae_for_eval(
+    model_path,
+    out_dim, cond_dim, hidden, latent_dim, H, beta,
+    macro_feature_indices,
+    macro_hidden_dim, macro_latent_dim,
+    device="cuda",
+    macro_encoder_path="macro_encoder.pth",
+):
+    device = torch.device(device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu")
+
+    macro_input_dim = len(macro_feature_indices)
+    macro_encoder = MacroEncoder(macro_input_dim, macro_hidden_dim, macro_latent_dim).to(device)
+    macro_encoder.load_state_dict(torch.load(macro_encoder_path, map_location=device))
+    macro_encoder.eval()
+    for p in macro_encoder.parameters():
+        p.requires_grad = False
+
+    encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
+    decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
+    prior   = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
+
+    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    return model, device
+
+def rolling_forward_backtest(
+    model_path,
+    X, Y, C,
+    latent_dim, cond_dim, hidden, H, beta,
+    macro_feature_indices,
+    macro_hidden_dim=128,
+    macro_latent_dim=32,
+    device="cuda",
+    macro_encoder_path="macro_encoder.pth",
+    # CRPS 설정
+    crps_feature_index=0,
+    num_samples=500,
+    z_shrink=1.0,
+    sample_from_student_t=True,
+    seed=0,
+):
+    """
+    X: (N,L,D), Y: (N,H,D), C: (N,cond_dim)
+    rolling-forward = i=0..N-1 anchor를 순회하며 metric 누적
+    """
+    set_seed(seed)
+
+    X = np.asarray(X); Y = np.asarray(Y); C = np.asarray(C)
+    N, L, D = X.shape
+    assert Y.shape[0] == N and Y.shape[1] == H and Y.shape[2] == D
+    assert C.shape[0] == N
+
+    model, dev = load_timevae_for_eval(
+        model_path=model_path,
+        out_dim=D, cond_dim=cond_dim, hidden=hidden, latent_dim=latent_dim, H=H, beta=beta,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=macro_hidden_dim, macro_latent_dim=macro_latent_dim,
+        device=device,
+        macro_encoder_path=macro_encoder_path,
+    )
+
+    # --- accumulators ---
+    sse = 0.0
+    sae = 0.0
+    n_elem = 0
+
+    nll_sum = 0.0
+    nll_count = 0
+
+    crps_sum_per_h = np.zeros(H, dtype=float)
+    crps_count = 0
+
+    with torch.no_grad():
+        for i in range(N):
+            x = torch.tensor(X[i:i+1]).float().to(dev)     # (1,L,D)
+            y = torch.tensor(Y[i:i+1]).float().to(dev)     # (1,H,D)
+            c = torch.tensor(C[i:i+1]).float().to(dev)     # (1,cond)
+
+            # (macro_x는 model 내부에서 prior에 쓰일 수 있으나, 여기서는 포스터리어 경로만 사용)
+            # macro_x = x[:, :, macro_feature_indices].permute(0,2,1)
+
+            # ---- posterior mean forecast (deterministic point) ----
+            mu_q, logvar_q = model.encoder(x, c)
+            mean, dist = model.decoder(mu_q, c)            # mean: (1,H,D), dist: Student-t
+
+            # RMSE/MAE (전체 H*D 평균)
+            diff = (mean - y).cpu().numpy()
+            sse += float(np.sum(diff ** 2))
+            sae += float(np.sum(np.abs(diff)))
+            n_elem += diff.size
+
+            # NLL (샘플링 없이 고정)
+            nll = -dist.log_prob(y).mean().item()
+            nll_sum += float(nll)
+            nll_count += 1
+
+            # ---- CRPS (scenario 기반) ----
+            # z 샘플링 (posterior around mu_q)
+            std_q = torch.exp(0.5 * logvar_q)              # (1,latent)
+            M = int(num_samples)
+
+            eps = torch.randn((M, latent_dim), device=dev)
+            z = mu_q.expand(M, -1) + float(z_shrink) * std_q.expand(M, -1) * eps
+            c_rep = c.expand(M, -1)
+
+            mean_s, dist_s = model.decoder(z, c_rep)       # (M,H,D)
+            if sample_from_student_t:
+                y_s = dist_s.rsample()                     # (M,H,D)
+            else:
+                y_s = mean_s
+
+            samples = y_s.cpu().numpy()                    # (M,H,D)
+            crps_per_h = crps_from_samples_fast_1feature(
+                samples_MHD=samples,
+                y_HD=Y[i],                                 # (H,D)
+                feature_index=crps_feature_index
+            )
+            crps_sum_per_h += crps_per_h
+            crps_count += 1
+
+    mse = sse / max(1, n_elem)
+    rmse = float(np.sqrt(mse))
+    mae = sae / max(1, n_elem)
+
+    nll_mean = nll_sum / max(1, nll_count)
+
+    crps_per_h = crps_sum_per_h / max(1, crps_count)
+    crps_mean = float(np.mean(crps_per_h))
+
+    return {
+        "RMSE": rmse,
+        "MAE": float(mae),
+        "MSE": float(mse),
+        "NLL_mean": float(nll_mean),
+        "CRPS_mean": crps_mean,
+        "CRPS_per_h": crps_per_h,
+        "settings": {
+            "num_samples": int(num_samples),
+            "z_shrink": float(z_shrink),
+            "student_t_sample": bool(sample_from_student_t),
+            "seed": int(seed),
+            "crps_feature_index": int(crps_feature_index),
+        }
+    }
