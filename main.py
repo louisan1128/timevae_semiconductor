@@ -1,5 +1,5 @@
 # ===========================================
-# main.py — 전체 파이프라인 실행 (FIXED for MACRO_X-based scenario_eval.py)
+# main.py — 전체 파이프라인 실행
 # ===========================================
 
 import numpy as np
@@ -19,46 +19,14 @@ from scenario_eval import (
     rolling_posterior_forecast,
     plot_full_forecast_and_scenario,
     posterior_scenario,
+
     compute_point_forecast_metrics,
     compute_coverage_and_sharpness,
     compute_crps_from_samples,
+    student_t_nll_torch,
     evaluate_student_t_nll,
+    compute_risk_metrics,
 )
-
-# ---- (옵션) risk metric을 scenario_eval 안쓰고 main에서 로컬로 정의 ----
-def compute_risk_metrics(
-    scenario_samples,
-    current_level_scaled,
-    scaler,
-    feature_index=0,
-    horizon_idx=-1,
-    tail_threshold_raw=-0.10,
-    alpha=0.10
-):
-    S = np.array(scenario_samples)  # (M,H,D) scaled
-    future_scaled = S[:, horizon_idx, :]  # (M,D)
-
-    future_raw = scaler.inverse_transform(future_scaled)[:, feature_index]
-    current_raw = scaler.inverse_transform(
-        np.asarray(current_level_scaled).reshape(1, -1)
-    )[0, feature_index]
-
-    ret = (future_raw - current_raw) / (current_raw + 1e-12)
-
-    p_up = float(np.mean(ret > 0))
-    p_tail = float(np.mean(ret < tail_threshold_raw))
-
-    var_alpha = float(np.quantile(ret, alpha))
-    tail = ret[ret <= var_alpha]
-    es_alpha = float(tail.mean()) if len(tail) >= 3 else var_alpha
-
-    return {
-        "P_up": p_up,
-        f"P_tail(<{tail_threshold_raw*100:.1f}%)": p_tail,
-        f"VaR_{int(alpha*100)}%": var_alpha,
-        f"ES_{int(alpha*100)}%": es_alpha,
-    }
-
 
 # -------------------------------
 # Hyperparameters
@@ -81,7 +49,7 @@ MACRO_HIDDEN_DIM = 128
 MACRO_LATENT_DIM = 32
 
 # -------------------------------
-# Condition columns (raw)
+# Condition columns (must exist in merged df)
 # -------------------------------
 condition_raw_cols = [
     "Exchange Rate",
@@ -91,6 +59,7 @@ condition_raw_cols = [
     "ISM",
 ]
 
+# macro.csv base columns (preprocess에서 feature engineering해서 6개로 만듦)
 MACRO_COLS = [
     "PMI",
     "GS10",
@@ -106,31 +75,27 @@ MACRO_COLS = [
 if __name__ == "__main__":
 
     print("========== 1) Preprocessing ==========")
-    X, Y, C, scaler, df_raw, df_scaled, macro_feature_indices = preprocess(
+
+    X, Y, C, MACRO_X, scaler, df_raw, df_scaled, macro_feature_indices, macro_feat_cols = preprocess(
         csv_path="data.csv",
         macro_csv_path="macro.csv",
         condition_raw_cols=condition_raw_cols,
         macro_cols=MACRO_COLS,
         L=L,
         H=H,
+        # macro_scaler_path="macro_scaler.pkl",  # 있으면 켜기(없으면 주석)
     )
-    print("X:", X.shape, "Y:", Y.shape, "C:", C.shape)
 
-    # ---------------------------------------------------------
-    # 핵심 FIX: scenario_eval.py가 요구하는 MACRO_X를 여기서 구성
-    # X: (N, L, D)
-    # MACRO_X: (N, macro_dim, L)
-    # ---------------------------------------------------------
-    MACRO_X = np.transpose(X[:, :, macro_feature_indices], (0, 2, 1)).astype(np.float32)
-    print("MACRO_X:", MACRO_X.shape)
+    print("X:", X.shape, "Y:", Y.shape, "C:", C.shape, "MACRO_X:", MACRO_X.shape)
     print("======================================\n")
 
     # =======================================
     # 2) Train model
     # =======================================
     print("========== 2) Training ==========")
+
     model = train_model(
-        X, Y, C,
+        X, Y, C, MACRO_X,
         latent_dim=LATENT_DIM,
         cond_dim=COND_DIM,
         hidden=HIDDEN,
@@ -140,14 +105,17 @@ if __name__ == "__main__":
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         device=DEVICE,
-        macro_feature_indices=macro_feature_indices,  # train_model은 여전히 indices 방식
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
+        macro_encoder_path="macro_encoder.pth",
     )
+
     print("=================================\n")
 
     # =======================================
-    # 3) Posterior Evaluation
+    # 5) Posterior Evaluation
     # =======================================
-    print("========== 3) Posterior Evaluation ==========")
+    print("========== 5) Posterior Evaluation ==========")
 
     preds, trues, mse_eval = evaluate_model(
         model_path="timevae_ctvae_prior.pth",
@@ -166,9 +134,9 @@ if __name__ == "__main__":
     print("=================================\n")
 
     # =======================================
-    # 4) Scenario Generation
+    # 6) Scenario Generation
     # =======================================
-    print("========== 4) Scenario Forecasting ==========")
+    print("========== 6) Scenario Forecasting ==========")
 
     last_truth_raw = df_raw.iloc[-1]
     print("===== Last RAW sample =====")
@@ -182,22 +150,19 @@ if __name__ == "__main__":
         "ISM": 51.4,
     }
 
-    # raw → scaled (전체 feature 벡터 길이 D로 맞춰야 scaler가 먹음)
-    full_raw = [
-        scenario_cond_raw[col] if col in scenario_cond_raw else last_truth_raw[col]
-        for col in df_raw.index  # df_raw는 Series니까 index가 column list 역할
-    ]
+    cols = list(df_raw.columns)
+    full_raw = [scenario_cond_raw.get(col, last_truth_raw[col]) for col in cols]
     scaled_full = scaler.transform([full_raw])[0]
 
-    scenario_cond_scaled = np.array([
-        scaled_full[list(df_raw.index).index(col)]
-        for col in condition_raw_cols
-    ], dtype=np.float32)
+    scenario_cond_scaled = np.array(
+        [scaled_full[cols.index(col)] for col in condition_raw_cols],
+        dtype=np.float32
+    )
 
     scenario_samples = scenario_predict_local(
         model_path="timevae_ctvae_prior.pth",
-        X_last=X[-1],
-        macro_x_last=MACRO_X[-1],
+        X_last=X[-1],                     # (L,D)
+        macro_x_last=MACRO_X[-1],          # (6,L)
         cond_true=C[-1],
         cond_scenario=scenario_cond_scaled,
         latent_dim=LATENT_DIM,
@@ -210,13 +175,13 @@ if __name__ == "__main__":
         macro_hidden_dim=MACRO_HIDDEN_DIM,
         macro_latent_dim=MACRO_LATENT_DIM,
         device=DEVICE,
-        sample_from_student_t=True,
+        sample_from_student_t=True
     )
 
     # =======================================
-    # 5) Fan Chart 출력
+    # 7) Fan Chart
     # =======================================
-    print("========== 5) Plotting Fan Chart ==========")
+    print("========== 7) Plotting Fan Chart ==========")
 
     plot_fanchart(
         true_seq=trues[-1],
@@ -233,16 +198,12 @@ if __name__ == "__main__":
         history=60
     )
 
-    print("=========== Completed Fan Chart ===========")
+    print("=========== Completed 1st! ===========")
 
-    # =======================================
-    # 6) Rolling posterior forecast
-    # =======================================
+    # Rolling forecast
     forecast_full = rolling_posterior_forecast(
         "timevae_ctvae_prior.pth",
-        X=X,
-        C=C,
-        MACRO_X=MACRO_X,
+        X, C, MACRO_X,
         latent_dim=LATENT_DIM,
         cond_dim=COND_DIM,
         hidden=HIDDEN,
@@ -253,8 +214,8 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
-    # 마지막 시점 posterior scenario
-    samples_post = posterior_scenario(
+    # 마지막 시점 posterior scenario (mean-based)
+    samples = posterior_scenario(
         model_path="timevae_ctvae_prior.pth",
         X_last=X[-1],
         C_last=C[-1],
@@ -271,7 +232,7 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
-    true_full = Y[:, 0, :]  # (N, D)
+    true_full = Y[:, 0, :]
 
     plot_full_forecast_and_scenario(
         true_full=true_full,
@@ -281,10 +242,10 @@ if __name__ == "__main__":
         H=H
     )
 
-    # =======================================
-    # 7) Metrics
-    # =======================================
+    # Metrics
     point_metrics = compute_point_forecast_metrics(preds, trues)
+    print("=========== Completed 2nd! ===========")
+
     print("=== Point Forecast Metrics ===")
     for k, v in point_metrics.items():
         print(f"{k} : {v}")
@@ -297,9 +258,9 @@ if __name__ == "__main__":
         hidden=HIDDEN,
         H=H,
         beta=BETA,
+        device=DEVICE,
         macro_hidden_dim=MACRO_HIDDEN_DIM,
         macro_latent_dim=MACRO_LATENT_DIM,
-        device=DEVICE
     )
     print("=== Probabilistic (Student-t) Metrics ===")
     print("NLL_mean:", nll_metrics["NLL_mean"])
@@ -325,8 +286,7 @@ if __name__ == "__main__":
     print(f"CRPS_mean: {crps['CRPS_mean']:.4f}")
     print("CRPS_per_h:", np.round(crps["CRPS_per_h"], 4))
 
-    # risk metrics
-    current_level_scaled = X[-1][-1, :]  # (D,)
+    current_level_scaled = X[-1][-1, :]
     risk = compute_risk_metrics(
         scenario_samples=scenario_samples,
         current_level_scaled=current_level_scaled,
