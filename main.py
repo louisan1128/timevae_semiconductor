@@ -289,10 +289,12 @@ if __name__ == "__main__":
     # 6) Scenario Generation
     # =======================================
     print("========== 6) Scenario Forecasting ==========")
-
-    last_truth_raw = df_raw.iloc[-1]
-    print("===== Last RAW sample =====")
+    last_truth_raw = df_raw.iloc[-H-1]  # X[-1]의 마지막 timestep과 동일한 날짜
+    
+    print("===== Scenario anchor RAW (X_end) =====")
     print(last_truth_raw)
+    print("===== Horizon starts at =====", df_raw.index[-H])
+    print("===== Horizon ends at   =====", df_raw.index[-1])
 
     scenario_cond_raw = {
         "Exchange Rate": 1388.91,
