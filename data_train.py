@@ -27,106 +27,136 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx], self.c[idx]
-
+    
 # -------------------------------
 # Create Dataset (Sliding Window)
 # -------------------------------
-def create_dataset(df_scaled, L, H, cond_cols):
+def create_dataset(df_scaled: pd.DataFrame, L: int, H: int, cond_cols):
     X, Y, C = [], [], []
     total_len = len(df_scaled)
 
-    for start in range(total_len - L - H):
+    # +1 포함이 보통 정석 (마지막 가능한 window 포함)
+    for start in range(total_len - L - H + 1):
         end_x = start + L
         end_y = end_x + H
 
-        x = df_scaled.iloc[start:end_x].values      # (L,D)
-        y = df_scaled.iloc[end_x:end_y].values      # (H,D)
-        c = df_scaled.iloc[end_x - 1][cond_cols].values  # (cond_dim,)
+        x = df_scaled.iloc[start:end_x].to_numpy(dtype=np.float32)  # (L,D)
+        y = df_scaled.iloc[end_x:end_y].to_numpy(dtype=np.float32)  # (H,D)
+        c = df_scaled.iloc[end_x - 1][cond_cols].to_numpy(dtype=np.float32)  # (cond_dim,)
 
         X.append(x)
         Y.append(y)
         C.append(c)
 
-    return (
-        np.array(X, dtype=np.float32),
-        np.array(Y, dtype=np.float32),
-        np.array(C, dtype=np.float32),
-    )
+    return np.asarray(X, dtype=np.float32), np.asarray(Y, dtype=np.float32), np.asarray(C, dtype=np.float32)
 
 
+def _read_csv_with_date_index(csv_path: str, encoding: str, date_col: str = "Date") -> pd.DataFrame:
+    df = pd.read_csv(csv_path, encoding=encoding)
+    if date_col not in df.columns:
+        raise ValueError(f"'{date_col}' column not found in {csv_path}")
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    return df
 
 
+def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
+    # 콤마(1,388.90) / 공백 / 문자열 등 안전 처리
+    out = df.copy()
+    for col in out.columns:
+        out[col] = pd.to_numeric(
+            out[col].astype(str).str.replace(",", "").str.strip(),
+            errors="coerce",
+        )
+    return out
 
-# -------------------------------
-# Preprocess (Load CSV → Scaling)
-# -------------------------------
-def preprocess(csv_path, macro_csv_path, condition_raw_cols, macro_cols, L, H):
+
+def preprocess(
+    csv_path: str,
+    macro_csv_path: str,
+    condition_raw_cols,
+    macro_cols,
+    L: int,
+    H: int,
+    *,
+    semi_encoding: str = "latin1",
+    macro_encoding: str = "utf-8-sig",
+    drop_semi_cols=("PMI",),        # 반도체쪽 PMI 제거 기본값 유지
+    capex_col: str = "CAPEX",
+    fill_strategy: str = "ffill_bfill",  # "zero" or "ffill_bfill"
+):
     """
-    semi_csv_path : 반도체 데이터 csv (data.csv)
-    macro_csv_path: 매크로 데이터 csv (macro.csv)
-    condition_raw_cols : TimeVAE condition용 컬럼 이름 리스트 (5개)
-    macro_cols : macro encoder가 보는 macro 컬럼 이름 리스트 (6개)
+    csv_path: 반도체 데이터 csv
+    macro_csv_path: 매크로 데이터 csv
+    condition_raw_cols: TimeVAE condition용 컬럼 리스트
+    macro_cols: macro encoder가 보는 macro 컬럼 리스트
     """
-    
-    df_semi = pd.read_csv(csv_path, encoding="latin1")
-    df_semi["Date"] = pd.to_datetime(df_semi["Date"])
-    df_semi = df_semi.set_index("Date")
 
+    # 1) Load
+    df_semi = _read_csv_with_date_index(csv_path, encoding=semi_encoding)
+    df_macro = _read_csv_with_date_index(macro_csv_path, encoding=macro_encoding)
 
-    # 2) 매크로 데이터
-    df_macro = pd.read_csv("macro.csv", encoding="utf-8-sig")
-    df_macro["Date"] = pd.to_datetime(df_macro["Date"])
-    df_macro = df_macro.set_index("Date")
+    # 2) Select macro cols (없으면 에러 내서 빨리 잡기)
+    missing_macro = [c for c in macro_cols if c not in df_macro.columns]
+    if missing_macro:
+        raise ValueError(f"macro_csv is missing columns: {missing_macro}")
+    df_macro = df_macro[macro_cols].copy()
 
-    # 매크로에서 필요한 컬럼만 남기기
-    df_macro = df_macro[macro_cols]
+    # 3) Optional: drop semi cols
+    for col in drop_semi_cols:
+        if col in df_semi.columns:
+            df_semi = df_semi.drop(columns=[col])
 
-    # 3) 날짜 기준으로 inner join (공통 구간만 사용)
-    df_semi = df_semi.drop(columns=["PMI"])    # 반도체 PMI 제거
-    df_merged = pd.merge(df_semi, df_macro, on="Date", how="inner")
+    # 4) Merge by index (Date)
+    df_merged = df_semi.join(df_macro, how="inner")
+    df_raw = df_merged.copy()  # raw 저장(시각화/리포팅용)
 
-    df_raw = df_merged.copy()
+    # 5) Numeric conversion (콤마/문자열 포함 안전 처리)
+    df_merged = _coerce_numeric_df(df_merged)
 
-    # 4) numeric 변환
-    for col in df_merged.columns:
-        df_merged[col] = pd.to_numeric(df_merged[col], errors="coerce")
+    # 6) CAPEX log1p (0/음수 방어)
+    if capex_col in df_merged.columns:
+        # 음수 있으면 log1p가 NaN 되니까, 최소 0으로 클립(원하면 다른 방식 가능)
+        cap = df_merged[capex_col].to_numpy()
+        cap = np.clip(cap, a_min=0.0, a_max=None)
+        df_merged[capex_col] = np.log1p(cap)
 
-    # 5) CAPEX 로그 변환
-    if "CAPEX" in df_merged.columns:
-        df_merged["CAPEX"] = np.log1p(df_merged["CAPEX"])
+    # 7) Missing handling
+    # condition/macro는 0으로 고정하는 기존 정책 유지 + 전체 fill 전략
+    for col in condition_raw_cols:
+        if col not in df_merged.columns:
+            raise ValueError(f"condition column not found after merge: {col}")
+    df_merged[condition_raw_cols] = df_merged[condition_raw_cols].fillna(0.0)
 
+    df_merged[macro_cols] = df_merged[macro_cols].fillna(0.0)
 
-    # 6) 결측치 처리
-    #    - condition 컬럼은 0으로
-    df_merged[condition_raw_cols] = df_merged[condition_raw_cols].fillna(0)
-    #    - macro 컬럼도 0으로
-    df_merged[macro_cols] = df_merged[macro_cols].fillna(0)
-    #    - 그 외는 그냥 ffll/bfill 또는 0 등 필요하면 추가 처리 가능
-    df_merged = df_merged.fillna(0)
+    if fill_strategy == "ffill_bfill":
+        df_merged = df_merged.ffill().bfill()
+        df_merged = df_merged.fillna(0.0)  # 끝까지 남는 NaN 방어
+    elif fill_strategy == "zero":
+        df_merged = df_merged.fillna(0.0)
+    else:
+        raise ValueError("fill_strategy must be 'ffill_bfill' or 'zero'")
 
-
-     # 7) 스케일링
+    # 8) Scaling (DataFrame 유지: feature name 경고 방지 + 순서 안전)
     scaler = StandardScaler()
     df_scaled = pd.DataFrame(
         scaler.fit_transform(df_merged),
         index=df_merged.index,
-        columns=df_merged.columns
+        columns=df_merged.columns,
     )
 
-    # 8) macro feature index (X에서 macro만 뽑기 위해)
-    macro_feature_indices = [
-        df_scaled.columns.get_loc(col) for col in macro_cols
-    ]
-    
-    
-    # 9) Sliding window 만들기
+    # 9) macro feature indices
+    macro_feature_indices = [df_scaled.columns.get_loc(col) for col in macro_cols]
+
+    # 10) Sliding windows
     X, Y, C = create_dataset(df_scaled, L, H, condition_raw_cols)
 
     print("X shape:", X.shape)  # (N,L,D)
     print("Y shape:", Y.shape)  # (N,H,D)
     print("C shape:", C.shape)  # (N,cond_dim)
     print("macro_feature_indices:", macro_feature_indices)
-    
 
     return X, Y, C, scaler, df_raw, df_scaled, macro_feature_indices
 
@@ -271,8 +301,6 @@ def rolling_backtest( model_path, X, Y, C,
         macro_x = x[:, :, :6].permute(0, 2, 1)
         y_true = Y[t:t+1]
 
-        # macro_x: (1, macro_dim, L)
-        macro_x = x[:, :, macro_feature_indices].permute(0, 2, 1)
 
         with torch.no_grad():
             pred, z, prior_stats = model(
@@ -335,10 +363,12 @@ def rolling_forward_test(X, Y, C,
         )
 
         # 4) Forecast
+        # rolling_forward_test() Forecast 부분
         with torch.no_grad():
             x = torch.tensor(X_test).float().to(device)
             c = torch.tensor(C_test).float().to(device)
-            macro_x = x[:, :, :6].permute(0, 2, 1)
+
+            macro_x = x[:, :, macro_feature_indices].permute(0, 2, 1)  # <-- 여기!
 
             pred, z, prior_stats = model(
                 x, c, macro_x,
