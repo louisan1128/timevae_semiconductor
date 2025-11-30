@@ -1,17 +1,18 @@
 # ===========================================
-# data_train_utils.py
+# data_train.py
 # (Dataset + Preprocessing + Training + Backtests)
 # ===========================================
 
-from __future__ import annotations
-
 import numpy as np
 import pandas as pd
-import joblib
-
+from sklearn.preprocessing import StandardScaler
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+
+try:
+    import joblib  # for macro_scaler.pkl (optional)
+except Exception:
+    joblib = None
 
 from model import Encoder, Decoder, ConditionalPrior, TimeVAE
 from macro_pretrain import MacroEncoder
@@ -21,14 +22,7 @@ from macro_pretrain import MacroEncoder
 # Dataset
 # -------------------------------
 class TimeSeriesDataset(Dataset):
-    """
-    Returns:
-      x      : (L, D_all)
-      y      : (H, D_all)
-      c      : (cond_dim,)
-      macro_x: (macro_dim, L)
-    """
-    def __init__(self, x: np.ndarray, y: np.ndarray, c: np.ndarray, macro_x: np.ndarray):
+    def __init__(self, x, y, c, macro_x):
         self.x = x
         self.y = y
         self.c = c
@@ -48,7 +42,6 @@ def _read_csv_with_date_index(csv_path: str, encoding: str, date_col: str = "Dat
     df = pd.read_csv(csv_path, encoding=encoding)
     if date_col not in df.columns:
         raise ValueError(f"'{date_col}' column not found in {csv_path}")
-
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
     return df
@@ -64,158 +57,130 @@ def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _make_macro_features_pretrain_style(df_macro_raw: pd.DataFrame) -> pd.DataFrame:
+def _make_macro_features(df_macro_base: pd.DataFrame, macro_cols_base) -> (pd.DataFrame, list):
     """
-    Pretrain에서 썼던 것과 동일하게 생성:
-      PMI, GS10, LOG_M2=log(M2SL), UNRATE, INFLATION=diff(log(CPIAUCSL)), LOG_INDPRO=log(INDPRO)
+    Input macro_cols_base (예: ['PMI','GS10','M2SL','UNRATE','CPIAUCSL','INDPRO'])
+    Output macro_feat_df with 6 cols:
+      ['PMI','GS10','LOG_M2','UNRATE','INFLATION','LOG_INDPRO']
     """
-    required = ["PMI", "GS10", "M2SL", "UNRATE", "CPIAUCSL", "INDPRO"]
-    missing = [c for c in required if c not in df_macro_raw.columns]
+    need = list(macro_cols_base)
+    missing = [c for c in need if c not in df_macro_base.columns]
     if missing:
-        raise ValueError(f"macro_csv is missing columns: {missing}")
+        raise ValueError(f"macro.csv missing columns: {missing}")
 
-    # 결측/보간: pretrain과 유사하게 forward-only로 최대한 맞추고, 남는 건 ffill
-    dm = df_macro_raw[required].copy()
-    dm = _coerce_numeric_df(dm)
-    dm = dm.ffill().interpolate(limit_direction="forward").ffill()
+    base = df_macro_base[need].copy()
+    base = _coerce_numeric_df(base)
 
-    # log 변환 안정성(0/음수 방지)
-    m2 = np.clip(dm["M2SL"].to_numpy(dtype=float), a_min=1e-12, a_max=None)
-    cpi = np.clip(dm["CPIAUCSL"].to_numpy(dtype=float), a_min=1e-12, a_max=None)
-    ip = np.clip(dm["INDPRO"].to_numpy(dtype=float), a_min=1e-12, a_max=None)
+    # --- features ---
+    feat = pd.DataFrame(index=base.index)
+    feat["PMI"] = base["PMI"]
+    feat["GS10"] = base["GS10"]
 
-    feat = pd.DataFrame(
-        {
-            "PMI": dm["PMI"].to_numpy(dtype=float),
-            "GS10": dm["GS10"].to_numpy(dtype=float),
-            "LOG_M2": np.log(m2),
-            "UNRATE": dm["UNRATE"].to_numpy(dtype=float),
-            "INFLATION": np.log(cpi),
-            "LOG_INDPRO": np.log(ip),
-        },
-        index=dm.index,
-    )
+    # LOG_M2: log1p(M2SL)
+    feat["LOG_M2"] = np.log1p(np.clip(base["M2SL"].to_numpy(dtype=float), a_min=0.0, a_max=None))
 
-    # INFLATION은 diff(log CPI)
-    feat["INFLATION"] = feat["INFLATION"].diff()
+    feat["UNRATE"] = base["UNRATE"]
 
-    # diff로 생긴 NaN 제거
-    feat = feat.dropna()
-    return feat
+    # INFLATION: 100 * diff(log(CPI))  (monthly log inflation)
+    cpi = np.clip(base["CPIAUCSL"].to_numpy(dtype=float), a_min=1e-8, a_max=None)
+    feat["INFLATION"] = 100.0 * np.diff(np.log(cpi), prepend=np.log(cpi[0]))
+
+    # LOG_INDPRO: log(INDPRO)
+    indpro = np.clip(base["INDPRO"].to_numpy(dtype=float), a_min=1e-8, a_max=None)
+    feat["LOG_INDPRO"] = np.log(indpro)
+
+    macro_feat_cols = ["PMI", "GS10", "LOG_M2", "UNRATE", "INFLATION", "LOG_INDPRO"]
+    return feat, macro_feat_cols
 
 
-# -------------------------------
-# Create Dataset (Sliding Window)
-# -------------------------------
-def create_dataset_with_macro(
-    df_all_scaled: pd.DataFrame,
-    df_macro_scaled: pd.DataFrame,
-    L: int,
-    H: int,
-    cond_cols,
-):
-    """
-    df_all_scaled  : (T, D_all)  - CT-VAE의 x/y/c를 생성할 전체 입력 (scaled)
-    df_macro_scaled: (T, D_macro)- MacroEncoder 입력용 (scaled by macro_scaler.pkl), pretrain-style features
-    """
-    if not df_all_scaled.index.equals(df_macro_scaled.index):
-        # 공통 인덱스로 재정렬 (inner)
-        common = df_all_scaled.index.intersection(df_macro_scaled.index)
-        df_all_scaled = df_all_scaled.loc[common]
-        df_macro_scaled = df_macro_scaled.loc[common]
-
-    for col in cond_cols:
-        if col not in df_all_scaled.columns:
-            raise ValueError(f"condition column not found in df_all_scaled: {col}")
-
-    X, Y, C, MX = [], [], [], []
-    total_len = len(df_all_scaled)
+def _create_windows(df_scaled: pd.DataFrame, L: int, H: int, cond_cols):
+    X, Y, C = [], [], []
+    total_len = len(df_scaled)
 
     for start in range(total_len - L - H + 1):
         end_x = start + L
         end_y = end_x + H
 
-        x = df_all_scaled.iloc[start:end_x].to_numpy(dtype=np.float32)   # (L, D_all)
-        y = df_all_scaled.iloc[end_x:end_y].to_numpy(dtype=np.float32)   # (H, D_all)
-        c = df_all_scaled.iloc[end_x - 1][cond_cols].to_numpy(dtype=np.float32)  # (cond_dim,)
-
-        macro_seq = df_macro_scaled.iloc[start:end_x].to_numpy(dtype=np.float32)  # (L, D_macro)
-        macro_seq = np.ascontiguousarray(macro_seq.T)  # (D_macro, L)
+        x = df_scaled.iloc[start:end_x].to_numpy(dtype=np.float32)     # (L,D)
+        y = df_scaled.iloc[end_x:end_y].to_numpy(dtype=np.float32)     # (H,D)
+        c = df_scaled.iloc[end_x - 1][cond_cols].to_numpy(dtype=np.float32)  # (cond_dim,)
 
         X.append(x)
         Y.append(y)
         C.append(c)
-        MX.append(macro_seq)
 
     return (
         np.asarray(X, dtype=np.float32),
         np.asarray(Y, dtype=np.float32),
         np.asarray(C, dtype=np.float32),
-        np.asarray(MX, dtype=np.float32),  # (N, D_macro, L)
     )
 
 
+def _create_macro_windows(df_macro_scaled: pd.DataFrame, L: int, H: int):
+    """
+    macro-only windows:
+      returns MACRO_X: (N, macro_dim, L)
+    """
+    MX = []
+    total_len = len(df_macro_scaled)
+
+    for start in range(total_len - L - H + 1):
+        end_x = start + L
+        m = df_macro_scaled.iloc[start:end_x].to_numpy(dtype=np.float32)  # (L,macro_dim)
+        m = np.transpose(m, (1, 0))  # (macro_dim, L)
+        MX.append(m)
+
+    return np.asarray(MX, dtype=np.float32)
+
+
 # -------------------------------
-# Preprocess (Load CSV → Align → Feature Eng → Scaling)
+# Preprocess
 # -------------------------------
 def preprocess(
     csv_path: str,
     macro_csv_path: str,
     condition_raw_cols,
-    macro_cols,   # (raw macro cols) kept for compatibility; macro feature eng uses required columns
+    macro_cols,
     L: int,
     H: int,
     *,
     semi_encoding: str = "latin1",
     macro_encoding: str = "utf-8-sig",
-    drop_semi_cols=("PMI",),        # 반도체쪽 PMI 제거 기본값 유지
+    drop_semi_cols=("PMI",),            # semi쪽 PMI 제거 (macro PMI로 대체)
     capex_col: str = "CAPEX",
     fill_strategy: str = "ffill_bfill",  # "zero" or "ffill_bfill"
-    #
-    macro_scaler_path: str = "macro_scaler.pkl",
-    use_macro_scaler_file: bool = True,
+    macro_scaler_path: str | None = None,  # "macro_scaler.pkl" (optional)
 ):
     """
-    Returns:
-      X, Y, C, MACRO_X,
-      scaler_all, macro_scaler,
-      df_raw_all, df_all_scaled,
-      macro_feature_indices (for convenience; in df_all_scaled),
-      macro_feat_cols (actual macro feature names used)
+    Returns 9 values:
+      X, Y, C, MACRO_X, scaler, df_raw, df_all_scaled, macro_feature_indices, macro_feat_cols
     """
-
-    # 1) Load
+    # 1) load
     df_semi = _read_csv_with_date_index(csv_path, encoding=semi_encoding)
     df_macro = _read_csv_with_date_index(macro_csv_path, encoding=macro_encoding)
 
-    # 2) drop semi cols (e.g., PMI duplicates)
+    # 2) drop semi columns
     for col in drop_semi_cols:
         if col in df_semi.columns:
             df_semi = df_semi.drop(columns=[col])
 
-    # 3) Macro feature engineering (pretrain-style)
-    df_macro_feat = _make_macro_features_pretrain_style(df_macro)
+    # 3) make macro features (6 cols) from macro_cols base
+    df_macro_feat, macro_feat_cols = _make_macro_features(df_macro, macro_cols)
 
-    macro_feat_cols = ["PMI", "GS10", "LOG_M2", "UNRATE", "INFLATION", "LOG_INDPRO"]
-    df_macro_feat = df_macro_feat[macro_feat_cols].copy()
-
-    # 4) Merge: use engineered macro features in the main input too (recommended for consistency)
+    # 4) merge by date
     df_all = df_semi.join(df_macro_feat, how="inner")
+    df_raw = df_all.copy()
 
-    # raw copy (전처리 전 상태)
-    df_raw_all = df_all.copy()
-
-    # 5) Numeric conversion (safe)
+    # 5) numeric coercion (semi side too)
     df_all = _coerce_numeric_df(df_all)
 
-    # 6) CAPEX log1p (0/음수 방어)
+    # 6) CAPEX log1p
     if capex_col in df_all.columns:
         cap = df_all[capex_col].to_numpy(dtype=float)
         cap = np.clip(cap, a_min=0.0, a_max=None)
         df_all[capex_col] = np.log1p(cap)
 
-    # 7) Missing handling
-    # condition cols must exist
+    # 7) missing
     for col in condition_raw_cols:
         if col not in df_all.columns:
             raise ValueError(f"condition column not found after merge: {col}")
@@ -227,111 +192,83 @@ def preprocess(
     else:
         raise ValueError("fill_strategy must be 'ffill_bfill' or 'zero'")
 
-    # 8) Scaling for CT-VAE x/y/c (전체 피처)
-    scaler_all = StandardScaler()
+    # 8) scale ALL features for main model / decoder space
+    scaler = StandardScaler()
     df_all_scaled = pd.DataFrame(
-        scaler_all.fit_transform(df_all),
+        scaler.fit_transform(df_all),
         index=df_all.index,
         columns=df_all.columns,
     )
 
-    # 9) Scaling for macro encoder input (macro_scaler.pkl, pretrain distribution)
-    if use_macro_scaler_file:
+    # 9) macro indices in df_all_scaled (for debugging/figure, etc.)
+    macro_feature_indices = [df_all_scaled.columns.get_loc(c) for c in macro_feat_cols]
+
+    # 10) windows: X/Y/C from df_all_scaled
+    X, Y, C = _create_windows(df_all_scaled, L, H, condition_raw_cols)
+
+    # 11) MACRO_X: optionally apply macro_scaler.pkl (for macro encoder consistency)
+    df_macro_feat_aligned = df_macro_feat.loc[df_all_scaled.index]  # same rows as merged period
+
+    if macro_scaler_path is not None:
+        if joblib is None:
+            raise ImportError("joblib is required to load macro_scaler_path, but joblib import failed.")
         macro_scaler = joblib.load(macro_scaler_path)
+        df_macro_scaled_for_encoder = pd.DataFrame(
+            macro_scaler.transform(df_macro_feat_aligned),
+            index=df_macro_feat_aligned.index,
+            columns=df_macro_feat_aligned.columns,
+        )
     else:
-        macro_scaler = StandardScaler().fit(df_macro_feat.loc[df_all.index].values)
+        # fallback: use the same scaling as df_all_scaled for those macro columns
+        df_macro_scaled_for_encoder = df_all_scaled[macro_feat_cols].copy()
 
-    df_macro_scaled = pd.DataFrame(
-        macro_scaler.transform(df_macro_feat.loc[df_all.index].values),
-        index=df_all.index,
-        columns=macro_feat_cols,
-    )
+    MACRO_X = _create_macro_windows(df_macro_scaled_for_encoder, L, H)
 
-    # 10) Convenience indices: where macro features live in df_all_scaled
-    # (이제 macro_x는 별도 df_macro_scaled로 쓰지만, 그래도 디버깅/시각화용으로 유용)
-    macro_feature_indices = [df_all_scaled.columns.get_loc(col) for col in macro_feat_cols]
-
-    # 11) Sliding windows (X/Y/C + MACRO_X)
-    X, Y, C, MACRO_X = create_dataset_with_macro(
-        df_all_scaled, df_macro_scaled,
-        L=L, H=H,
-        cond_cols=condition_raw_cols,
-    )
-
-    print("X shape:", X.shape)            # (N, L, D_all)
-    print("Y shape:", Y.shape)            # (N, H, D_all)
-    print("C shape:", C.shape)            # (N, cond_dim)
-    print("MACRO_X shape:", MACRO_X.shape)  # (N, D_macro=6, L)
+    print("X shape:", X.shape)
+    print("Y shape:", Y.shape)
+    print("C shape:", C.shape)
+    print("MACRO_X shape:", MACRO_X.shape)
     print("macro_feat_cols:", macro_feat_cols)
     print("macro_feature_indices (in df_all_scaled):", macro_feature_indices)
 
-    return (
-        X, Y, C, MACRO_X,
-        scaler_all, macro_scaler,
-        df_raw_all, df_all_scaled,
-        macro_feature_indices, macro_feat_cols
-    )
+    return X, Y, C, MACRO_X, scaler, df_raw, df_all_scaled, macro_feature_indices, macro_feat_cols
 
 
 # -------------------------------
 # Training
 # -------------------------------
 def train_model(
-    X_train,
-    Y_train,
-    C_train,
-    MACRO_X_train,
-    latent_dim,
-    cond_dim,
-    hidden,
-    H_len,
-    beta,
-    lr,
-    epochs,
-    batch_size,
-    device,
-    *,
+    X_train, Y_train, C_train, MACRO_X_train,
+    latent_dim, cond_dim, hidden,
+    H_len, beta, lr, epochs, batch_size, device,
     macro_latent_dim=32,
     macro_hidden_dim=128,
-    macro_encoder_path: str = "macro_encoder.pth",
+    macro_encoder_path="macro_encoder.pth",
 ):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     out_dim = X_train.shape[-1]
+    macro_input_dim = MACRO_X_train.shape[1]
 
     train_dataset = TimeSeriesDataset(X_train, Y_train, C_train, MACRO_X_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    # 1) Pretrained MacroEncoder 로드 (pretrain style macro_x: (B, 6, L))
-    macro_input_dim = MACRO_X_train.shape[1]
+    # 1) frozen macro encoder
     macro_encoder = MacroEncoder(
         input_dim=macro_input_dim,
         hidden_dim=macro_hidden_dim,
-        latent_dim=macro_latent_dim
+        latent_dim=macro_latent_dim,
     ).to(device)
-
     macro_encoder.load_state_dict(torch.load(macro_encoder_path, map_location=device))
     macro_encoder.eval()
     for p in macro_encoder.parameters():
         p.requires_grad = False
 
-    # 2) TimeVAE 구성
+    # 2) CT-VAE (TimeVAE)
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H_len).to(device)
-    prior = ConditionalPrior(
-        cond_dim=cond_dim,
-        macro_latent_dim=macro_latent_dim,
-        latent_dim=latent_dim,
-        hidden=hidden
-    ).to(device)
+    prior = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
 
-    model = TimeVAE(
-        encoder=encoder,
-        decoder=decoder,
-        prior=prior,
-        macro_encoder=macro_encoder,
-        latent_dim=latent_dim,
-        beta=beta
-    ).to(device)
+    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -342,14 +279,14 @@ def train_model(
         epoch_kl = 0.0
         num_batches = 0
 
-        for x, y, c, macro_x in train_loader:
+        for x, y, c, mx in train_loader:
             x = x.to(device)
             y = y.to(device)
             c = c.to(device)
-            macro_x = macro_x.to(device)  # (B, 6, L)
+            mx = mx.to(device)  # (B, macro_dim, L)
 
             loss, recon, kl, _, _, _ = model(
-                x, c, macro_x, y,
+                x, c, mx, y,
                 use_prior_sampling_if_no_y=False
             )
 
@@ -357,9 +294,9 @@ def train_model(
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
-            epoch_recon += recon.item()
-            epoch_kl += kl.item()
+            epoch_loss += float(loss.item())
+            epoch_recon += float(recon.item())
+            epoch_kl += float(kl.item())
             num_batches += 1
 
         print(
@@ -375,41 +312,27 @@ def train_model(
 
 
 # ======================================================================
-# 1) Rolling Backtest (고정 모델로 1-step Forecast)
+# 1) Rolling Backtest (fixed model)
 # ======================================================================
 def rolling_backtest(
     model_path,
-    X,
-    Y,
-    C,
-    MACRO_X,
-    latent_dim,
-    cond_dim,
-    hidden,
-    H,
-    beta,
-    *,
+    X, Y, C, MACRO_X,
+    latent_dim, cond_dim, hidden, H, beta,
     macro_latent_dim=32,
     macro_hidden_dim=128,
     device="cuda",
-    macro_encoder_path: str = "macro_encoder.pth",
+    macro_encoder_path="macro_encoder.pth",
 ):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     out_dim = X.shape[-1]
-
-    # Pretrained MacroEncoder 로드
     macro_input_dim = MACRO_X.shape[1]
-    macro_encoder = MacroEncoder(
-        input_dim=macro_input_dim,
-        hidden_dim=macro_hidden_dim,
-        latent_dim=macro_latent_dim
-    ).to(device)
+
+    macro_encoder = MacroEncoder(macro_input_dim, macro_hidden_dim, macro_latent_dim).to(device)
     macro_encoder.load_state_dict(torch.load(macro_encoder_path, map_location=device))
     macro_encoder.eval()
     for p in macro_encoder.parameters():
         p.requires_grad = False
 
-    # 모델 구성 & 가중치 로드
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
     prior = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
@@ -419,55 +342,36 @@ def rolling_backtest(
     model.eval()
 
     mses = []
+    with torch.no_grad():
+        for t in range(len(X)):
+            x = torch.tensor(X[t:t+1]).float().to(device)
+            c = torch.tensor(C[t:t+1]).float().to(device)
+            mx = torch.tensor(MACRO_X[t:t+1]).float().to(device)
+            y_true = Y[t:t+1]
 
-    for t in range(len(X)):
-        x = torch.tensor(X[t:t+1]).float().to(device)
-        c = torch.tensor(C[t:t+1]).float().to(device)
-        macro_x = torch.tensor(MACRO_X[t:t+1]).float().to(device)  # (1,6,L)
-        y_true = Y[t:t+1]
-
-        with torch.no_grad():
-            mean, dist, z, src, post_stats, prior_stats = model(
-                x, c, macro_x,
+            mean, _, _, _, _, _ = model(
+                x, c, mx,
                 y=None,
                 use_prior_sampling_if_no_y=True
             )
             y_pred = mean.cpu().numpy()
-
-        mses.append(np.mean((y_pred - y_true) ** 2))
+            mses.append(np.mean((y_pred - y_true) ** 2))
 
     return float(np.mean(mses))
 
 
 # ======================================================================
-# 2) Rolling Forward Test (Expanding Window, 매 앵커마다 재학습)
+# 2) Rolling Forward Test (retrain per anchor)
 # ======================================================================
 def rolling_forward_test(
-    X,
-    Y,
-    C,
-    MACRO_X,
-    latent_dim,
-    cond_dim,
-    hidden,
-    H,
-    beta,
-    lr,
-    epochs,
-    batch_size,
-    *,
+    X, Y, C, MACRO_X,
+    latent_dim, cond_dim, hidden, H,
+    beta, lr, epochs, batch_size,
     macro_latent_dim=32,
     macro_hidden_dim=128,
     device="cuda",
-    macro_encoder_path: str = "macro_encoder.pth",
+    macro_encoder_path="macro_encoder.pth",
 ):
-    """
-    Expanding Window Rolling-Forward Backtest (정석)
-    매 anchor t에 대해:
-      - Train: 0 ~ t
-      - Test : t에서 1개 window 예측
-      - 모델 매번 재학습
-    """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     N = len(X)
 
@@ -476,13 +380,11 @@ def rolling_forward_test(
     for anchor in range(1, N - 1):
         print(f"[Rolling-Forward] Anchor {anchor}/{N}")
 
-        # expanding train
         X_train = X[:anchor]
         Y_train = Y[:anchor]
         C_train = C[:anchor]
         MX_train = MACRO_X[:anchor]
 
-        # test one
         X_test = X[anchor:anchor + 1]
         Y_test = Y[anchor:anchor + 1]
         C_test = C[anchor:anchor + 1]
@@ -490,15 +392,8 @@ def rolling_forward_test(
 
         model = train_model(
             X_train, Y_train, C_train, MX_train,
-            latent_dim=latent_dim,
-            cond_dim=cond_dim,
-            hidden=hidden,
-            H_len=H,
-            beta=beta,
-            lr=lr,
-            epochs=epochs,
-            batch_size=batch_size,
-            device=str(device),
+            latent_dim, cond_dim, hidden,
+            H, beta, lr, epochs, batch_size, device,
             macro_latent_dim=macro_latent_dim,
             macro_hidden_dim=macro_hidden_dim,
             macro_encoder_path=macro_encoder_path,
@@ -507,16 +402,15 @@ def rolling_forward_test(
         with torch.no_grad():
             x = torch.tensor(X_test).float().to(device)
             c = torch.tensor(C_test).float().to(device)
-            macro_x = torch.tensor(MX_test).float().to(device)
+            mx = torch.tensor(MX_test).float().to(device)
 
-            mean, dist, z, src, post_stats, prior_stats = model(
-                x, c, macro_x,
+            mean, _, _, _, _, _ = model(
+                x, c, mx,
                 y=None,
                 use_prior_sampling_if_no_y=True
             )
             y_pred = mean.cpu().numpy()
 
-        mse = float(np.mean((y_pred - Y_test) ** 2))
-        mse_list.append(mse)
+        mse_list.append(np.mean((y_pred - Y_test) ** 2))
 
     return float(np.mean(mse_list))
