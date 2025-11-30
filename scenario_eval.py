@@ -545,53 +545,51 @@ def student_t_nll_torch(y, mean, scale, df, eps=1e-6):
 def evaluate_student_t_nll(
     model_path, X, Y, C,
     latent_dim, cond_dim, hidden, H, beta,
+    macro_feature_indices,
+    macro_hidden_dim, macro_latent_dim,
     device="cuda"
 ):
-
-    device = torch.device(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dim = X.shape[-1]
 
-    # ===== model load =====
-    macro_encoder = MacroEncoder(6, 128, 32).to(device)
-    macro_encoder.load_state_dict(torch.load("macro_encoder.pth"))
+    # macro encoder (train과 동일 세팅)
+    macro_input_dim = len(macro_feature_indices)
+    macro_encoder = MacroEncoder(
+        input_dim=macro_input_dim,
+        hidden_dim=macro_hidden_dim,
+        latent_dim=macro_latent_dim
+    ).to(device)
+    macro_encoder.load_state_dict(torch.load("macro_encoder.pth", map_location=device))
     macro_encoder.eval()
+    for p in macro_encoder.parameters():
+        p.requires_grad = False
 
     encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
     decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior   = ConditionalPrior(cond_dim, 32, latent_dim, hidden).to(device)
+    prior   = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
 
     model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    # =======================
     nll_list = []
-
     with torch.no_grad():
         for i in range(len(X)):
-
             x = torch.tensor(X[i:i+1]).float().to(device)
             y = torch.tensor(Y[i:i+1]).float().to(device)
             c = torch.tensor(C[i:i+1]).float().to(device)
 
-            # macro latent
-            macro_x = x[:, :, :6].permute(0, 2, 1)
-            z_macro = macro_encoder(macro_x)
+            macro_x = x[:, :, macro_feature_indices].permute(0, 2, 1)
 
-            # posterior mean
-            mu_q, logvar_q = model.encoder(x, c)
-            z = mu_q
+            # train과 같은 경로로 recon_loss = -log_prob.mean()
+            loss, recon, kl, mean, z, prior_stats = model(
+                x, c, macro_x,
+                y=y,
+                use_prior_sampling_if_no_y=False
+            )
+            nll_list.append(recon.item())
 
-            # decoder already produces StudentT
-            mean, dist = model.decoder(z, c)
-
-            log_pdf = dist.log_prob(y)
-            nll = -log_pdf.mean().item()
-
-            nll_list.append(nll)
-
-    nll_arr = np.array(nll_list)
-
+    nll_arr = np.array(nll_list, dtype=np.float32)
     return {
         "NLL_mean": float(nll_arr.mean()),
         "NLL_std": float(nll_arr.std()),
