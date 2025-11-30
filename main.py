@@ -386,20 +386,28 @@ if __name__ == "__main__":
 
     
     res = rolling_forward_backtest(
-        model_path="timevae.pth",
-        X=X_test, Y=Y_test, C=C_test,
-        latent_dim=latent_dim, cond_dim=cond_dim, hidden=hidden, H=H, beta=beta,
+        model_path="timevae_ctvae_prior.pth",
+        X=X, Y=Y, C=C,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        beta=BETA,
         macro_feature_indices=macro_feature_indices,
-        macro_hidden_dim=128, macro_latent_dim=32,
-        num_samples=1000,      # CRPS 안정화
-        z_shrink=1.0,          # 평가면 1.0 추천
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
+        num_samples=1000,
+        z_shrink=1.0,
         sample_from_student_t=True,
         seed=0,
-        crps_feature_index=0,  # 예: DRAM index
+        crps_feature_index=0,
     )
     
-    print(res["RMSE"], res["NLL_mean"], res["CRPS_mean"])
-    print(res["CRPS_per_h"])
+    print("Rolling-forward (fixed model) metrics:")
+    print("RMSE:", res["RMSE"])
+    print("NLL_mean:", res["NLL_mean"])
+    print("CRPS_mean:", res["CRPS_mean"])
+    print("CRPS_per_h:", np.round(res["CRPS_per_h"], 4))
 
 
 
