@@ -4,14 +4,14 @@
 
 import numpy as np
 
-from data_train_utils import (
+from data_train import (
     preprocess,
     train_model,
     rolling_backtest,
     rolling_forward_test,
 )
 
-from scenario_eval_utils import (
+from scenario_eval import (
     evaluate_model,
     scenario_predict_local,
     plot_fanchart,
@@ -23,9 +23,14 @@ from scenario_eval_utils import (
     compute_point_forecast_metrics,
     compute_coverage_and_sharpness,
     compute_crps_from_samples,
+    student_t_nll_torch,
     evaluate_student_t_nll,
-    # compute_risk_metrics,  # (원하면 나중에 MACRO_X 버전으로 같이 업데이트)
+    compute_risk_metrics,
+    compare_models_point_forecast,
+    compare_models_probabilistic_nll,
+    run_ablation
 )
+
 
 # -------------------------------
 # Hyperparameters
