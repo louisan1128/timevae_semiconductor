@@ -447,12 +447,18 @@ class TimeVAE(nn.Module):
         # 3) conditional prior p(z|c, z_macro)
         mu_p, logvar_p = self.prior(c, z_macro)
 
-        # 4) inference-only 모드 (scenario generation / forecast)
-        if (y is None) and use_prior_sampling_if_no_y:
-            # prior에서 샘플링
-            z = self.reparameterize(mu_p, logvar_p)
+        # 4) inference / forecast 모드
+        if y is None:
+            if use_prior_sampling_if_no_y:
+                z = self.reparameterize(mu_p, logvar_p)   # prior predictive
+                src = "prior"
+            else:
+                z = self.reparameterize(mu_q, logvar_q)   # posterior predictive (history 사용)
+                src = "posterior"
+        
             mean, dist = self.decoder(z, c)
-            return mean, z, (mu_p, logvar_p)
+            return mean, dist, z, src, (mu_q, logvar_q), (mu_p, logvar_p)
+
         
 
         # 5) 학습 모드: q에서 샘플링
