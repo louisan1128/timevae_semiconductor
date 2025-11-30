@@ -388,8 +388,6 @@ class ConditionalPrior(nn.Module):
     def forward(self, c, z_macro):
         # c: (B, cond_dim)
         # z_macro: (B, macro_latent_dim)
-        if isinstance(z_macro, tuple):
-            z_macro = z_macro[-1]
         x = torch.cat([c, z_macro], dim=-1)   # (B, cond_dim + macro_latent_dim)
         h = self.net(x)
         return self.mu_head(h), self.logvar_head(h)
@@ -439,7 +437,12 @@ class TimeVAE(nn.Module):
 
         # 2) macro latent (frozen encoder)
         #    MacroEncoder는 (B, macro_dim, L) → (B, macro_latent_dim)
-        z_macro = self.macro_encoder(macro_x)
+        # 2) macro latent (frozen encoder)
+        z_macro_out = self.macro_encoder(macro_x)
+        if isinstance(z_macro_out, (tuple, list)):
+            z_macro = z_macro_out[0]   # mu
+        else:
+            z_macro = z_macro_out
 
         # 3) conditional prior p(z|c, z_macro)
         mu_p, logvar_p = self.prior(c, z_macro)
