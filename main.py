@@ -363,3 +363,40 @@ if __name__ == "__main__":
     print("=== Risk Metrics ===")
     for k, v in risk.items():
         print(f"{k}: {v}")
+        
+def debug_last_step_distribution(model, X, C, macro_feature_indices, Y=None, tag=""):
+    device = next(model.parameters()).device
+    x = torch.tensor(X[-1:]).float().to(device)          # (1,L,D)
+    c = torch.tensor(C[-1:]).float().to(device)          # (1,cond_dim)
+    macro_x = x[:, :, macro_feature_indices].permute(0, 2, 1)  # (1,macro_dim,L)
+
+    with torch.no_grad():
+        mu_q, logvar_q = model.encoder(x, c)
+        zq = mu_q
+        mean_q, dist_q = model.decoder(zq, c)
+
+        # prior 쪽도 비교(shift가 먹는지)
+        z_macro_out = model.macro_encoder(macro_x)
+        z_macro = z_macro_out[0] if isinstance(z_macro_out, (tuple, list)) else z_macro_out
+        mu_p, logvar_p = model.prior(c, z_macro)
+        zp = mu_p
+        mean_p, dist_p = model.decoder(zp, c)
+
+        def _stat(name, dist):
+            df = dist.df.detach().cpu().numpy().ravel()
+            sc = dist.scale.detach().cpu().numpy().ravel()
+            print(f"[{tag}] {name}: df median={np.median(df):.2f} (p10={np.percentile(df,10):.2f}, p90={np.percentile(df,90):.2f}) | "
+                  f"scale median={np.median(sc):.4f} (p10={np.percentile(sc,10):.4f}, p90={np.percentile(sc,90):.4f})")
+
+        print(f"[{tag}] ||mu_q-mu_p||_2 =", float(torch.norm(mu_q - mu_p, p=2)))
+        print(f"[{tag}] mean(std_q) =", float(torch.exp(0.5*logvar_q).mean()))
+        _stat("posterior(z=mu_q)", dist_q)
+        _stat("prior(z=mu_p)", dist_p)
+
+        if Y is not None:
+            y = torch.tensor(Y[-1:]).float().to(device)
+            nll_q = -dist_q.log_prob(y).mean().item()
+            nll_p = -dist_p.log_prob(y).mean().item()
+            print(f"[{tag}] NLL using z=mu_q: {nll_q:.4f} | using z=mu_p: {nll_p:.4f}")
+
+debug_last_step_distribution(model, X, C, macro_feature_indices, Y=Y, tag="LAST")
