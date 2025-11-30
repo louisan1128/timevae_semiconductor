@@ -388,6 +388,8 @@ class ConditionalPrior(nn.Module):
     def forward(self, c, z_macro):
         # c: (B, cond_dim)
         # z_macro: (B, macro_latent_dim)
+        if isinstance(z_macro, tuple):
+            z_macro = z_macro[-1]
         x = torch.cat([c, z_macro], dim=-1)   # (B, cond_dim + macro_latent_dim)
         h = self.net(x)
         return self.mu_head(h), self.logvar_head(h)
@@ -437,28 +439,17 @@ class TimeVAE(nn.Module):
 
         # 2) macro latent (frozen encoder)
         #    MacroEncoder는 (B, macro_dim, L) → (B, macro_latent_dim)
-        # 2) macro latent (frozen encoder)
-        z_macro_out = self.macro_encoder(macro_x)
-        if isinstance(z_macro_out, (tuple, list)):
-            z_macro = z_macro_out[0]   # mu
-        else:
-            z_macro = z_macro_out
+        z_macro = self.macro_encoder(macro_x)
 
         # 3) conditional prior p(z|c, z_macro)
         mu_p, logvar_p = self.prior(c, z_macro)
 
-        # 4) inference / forecast 모드
-        if y is None:
-            if use_prior_sampling_if_no_y:
-                z = self.reparameterize(mu_p, logvar_p)   # prior predictive
-                src = "prior"
-            else:
-                z = self.reparameterize(mu_q, logvar_q)   # posterior predictive (history 사용)
-                src = "posterior"
-        
+        # 4) inference-only 모드 (scenario generation / forecast)
+        if (y is None) and use_prior_sampling_if_no_y:
+            # prior에서 샘플링
+            z = self.reparameterize(mu_p, logvar_p)
             mean, dist = self.decoder(z, c)
-            return mean, dist, z, src, (mu_q, logvar_q), (mu_p, logvar_p)
-
+            return mean, z, (mu_p, logvar_p)
         
 
         # 5) 학습 모드: q에서 샘플링
