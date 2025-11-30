@@ -1,5 +1,5 @@
 # ===========================================
-# main.py — 전체 파이프라인 실행 (FIXED)
+# main.py — 전체 파이프라인 실행 (FIXED + DEBUG)
 # ===========================================
 import torch
 import numpy as np
@@ -48,6 +48,9 @@ DEVICE = "cuda"
 MACRO_HIDDEN_DIM = 128
 MACRO_LATENT_DIM = 32
 
+MODEL_PATH = "timevae_ctvae_prior.pth"
+MACRO_ENCODER_PATH = "macro_encoder.pth"
+
 # -------------------------------
 # Condition columns (raw)
 # -------------------------------
@@ -60,6 +63,23 @@ condition_raw_cols = [
 ]
 
 MACRO_COLS = [
+    "PMI",
+    "GS10",
+    "M2SL",
+    "UNRATE",
+    "CPIAUCSL",
+    "INDPRO",
+]
+
+# (옵션) feature name (df_raw/df_scaled 컬럼 순서와 맞추는 게 가장 좋음)
+# 너 출력 보면 아래 순서일 가능성이 높아서 일단 이렇게 둠.
+FEATURE_NAMES = [
+    "Export",
+    "DRAM",
+    "Exchange Rate",
+    "CAPEX",
+    "CLI",
+    "ISM",
     "PMI",
     "GS10",
     "M2SL",
@@ -85,23 +105,15 @@ def make_scaled_condition_vector(
     """
     preprocess와 동일한 규칙(숫자 coercion + CAPEX log1p)로
     raw scenario row -> scaled row -> condition vector를 만든다.
-    - feature-name warning 제거 (DataFrame으로 transform)
-    - object dtype 제거
-    - CAPEX 변환 불일치 버그 제거
     """
     cols = list(df_scaled.columns)
 
-    # last row를 dict로 만들고 scenario 값으로 overwrite
     row = last_truth_raw.to_dict()
     row.update(scenario_cond_raw)
 
-    # scaler가 fit된 컬럼 순서로 DataFrame 구성
     row_df = pd.DataFrame([row], columns=cols)
-
-    # numeric coercion
     row_df = row_df.apply(_clean_numeric_series, axis=0).fillna(0.0)
 
-    # preprocess와 동일: CAPEX log1p(음수 방어)
     if "CAPEX" in row_df.columns:
         cap = row_df["CAPEX"].to_numpy(dtype=np.float64)
         cap = np.clip(cap, 0.0, None)
@@ -114,6 +126,86 @@ def make_scaled_condition_vector(
         dtype=np.float32,
     )
     return cond_vec
+
+
+def debug_last_step_distribution(
+    model,
+    X_last,          # (L,D)
+    C_last,          # (cond_dim,)
+    macro_feature_indices,
+    Y_last=None,     # (H,D) or None
+    tag="LAST",
+):
+    """
+    *반드시* main 블록 안에서 model/X_last/C_last가 준비된 다음 호출할 것.
+    """
+    device = next(model.parameters()).device
+    x = torch.tensor(X_last[None]).float().to(device)          # (1,L,D)
+    c = torch.tensor(C_last[None]).float().to(device)          # (1,cond_dim)
+    macro_x = x[:, :, macro_feature_indices].permute(0, 2, 1)  # (1,macro_dim,L)
+
+    with torch.no_grad():
+        mu_q, logvar_q = model.encoder(x, c)
+        zq = mu_q
+        mean_q, dist_q = model.decoder(zq, c)
+
+        z_macro_out = model.macro_encoder(macro_x)
+        z_macro = z_macro_out[0] if isinstance(z_macro_out, (tuple, list)) else z_macro_out
+        mu_p, logvar_p = model.prior(c, z_macro)
+        zp = mu_p
+        mean_p, dist_p = model.decoder(zp, c)
+
+        def _stat(name, dist):
+            df = dist.df.detach().cpu().numpy().ravel()
+            sc = dist.scale.detach().cpu().numpy().ravel()
+            print(
+                f"[{tag}] {name}: df median={np.median(df):.2f} (p10={np.percentile(df,10):.2f}, p90={np.percentile(df,90):.2f}) | "
+                f"scale median={np.median(sc):.4f} (p10={np.percentile(sc,10):.4f}, p90={np.percentile(sc,90):.4f})"
+            )
+
+        print(f"[{tag}] ||mu_q-mu_p||_2 =", float(torch.norm(mu_q - mu_p, p=2)))
+        print(f"[{tag}] mean(std_q) =", float(torch.exp(0.5 * logvar_q).mean()))
+        _stat("posterior(z=mu_q)", dist_q)
+        _stat("prior(z=mu_p)", dist_p)
+
+        if Y_last is not None:
+            y = torch.tensor(Y_last[None]).float().to(device)
+            nll_q = -dist_q.log_prob(y).mean().item()
+            nll_p = -dist_p.log_prob(y).mean().item()
+            print(f"[{tag}] NLL using z=mu_q: {nll_q:.4f} | using z=mu_p: {nll_p:.4f}")
+
+
+def diagnose_crps_horizons(
+    scenario_samples,    # (M,H,D)
+    true_future,         # (H,D)
+    feature_index=0,
+    feature_name="(feature)",
+    qs=(10, 50, 90),
+    topk=4,
+):
+    """
+    CRPS_per_h가 터지는 horizon을 '왜 터졌는지' 빠르게 보는 텍스트 진단.
+    - median error, interval width, true 위치 등을 같이 봄.
+    """
+    S = np.array(scenario_samples)[:, :, feature_index]  # (M,H)
+    y = np.array(true_future)[:, feature_index]          # (H,)
+    p_lo, p_md, p_hi = [np.percentile(S, q, axis=0) for q in qs]  # (H,)
+
+    abs_med_err = np.abs(p_md - y)
+    width = p_hi - p_lo
+
+    # "문제 후보": median 오차가 큰 곳 + width가 큰 곳
+    score = abs_med_err + 0.25 * width
+    idxs = np.argsort(-score)[:topk]
+
+    print(f"\n[CRPS/Interval Diagnose] feature={feature_name} (idx={feature_index})")
+    for h in idxs:
+        inside = (y[h] >= p_lo[h]) and (y[h] <= p_hi[h])
+        print(
+            f"  h={h+1:02d} | true={y[h]: .4f} | p{qs[0]}={p_lo[h]: .4f}  p{qs[1]}={p_md[h]: .4f}  p{qs[2]}={p_hi[h]: .4f} | "
+            f"|med-true|={abs_med_err[h]:.4f} | width={width[h]:.4f} | inside={inside}"
+        )
+    print("")
 
 
 # ===========================================
@@ -158,13 +250,23 @@ if __name__ == "__main__":
 
     print("=================================\n")
 
+    # (선택) 저장된 가중치로 확실히 맞추고 싶으면 다시 로드
+    # train_model이 동일 path로 저장한다는 전제
+    try:
+        dev = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=dev))
+        model.to(dev)
+        model.eval()
+    except Exception as e:
+        print("[WARN] Could not reload model from disk:", e)
+
     # =======================================
     # 5) Posterior Evaluation
     # =======================================
     print("========== 5) Posterior Evaluation ==========")
 
     preds, trues, mse_eval = evaluate_model(
-        model_path="timevae_ctvae_prior.pth",
+        model_path=MODEL_PATH,
         X=X, Y=Y, C=C,
         latent_dim=LATENT_DIM,
         cond_dim=COND_DIM,
@@ -177,7 +279,10 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
+    # 기존 출력(MSE) + 추가로 MAE/RMSE도 같이
+    post_metrics = compute_point_forecast_metrics(preds, trues)
     print(f"Posterior Recon MSE: {mse_eval:.6f}")
+    print("Posterior Recon (MSE/MAE/RMSE):", post_metrics)
     print("=================================\n")
 
     # =======================================
@@ -185,12 +290,10 @@ if __name__ == "__main__":
     # =======================================
     print("========== 6) Scenario Forecasting ==========")
 
-    # 실제 마지막 month의 RAW 값
     last_truth_raw = df_raw.iloc[-1]
     print("===== Last RAW sample =====")
     print(last_truth_raw)
 
-    # 시나리오 조건 (RAW 형태)
     scenario_cond_raw = {
         "Exchange Rate": 1388.91,
         "CAPEX": 93163.0,
@@ -199,7 +302,6 @@ if __name__ == "__main__":
         "ISM": 51.4,
     }
 
-    # ✅ FIXED: safe raw->scaled condition vector (feature-name warning / object dtype / CAPEX log1p 일치)
     scenario_cond_scaled = make_scaled_condition_vector(
         last_truth_raw=last_truth_raw,
         scenario_cond_raw=scenario_cond_raw,
@@ -208,9 +310,8 @@ if __name__ == "__main__":
         condition_raw_cols=condition_raw_cols,
     )
 
-    # 시나리오 샘플링
     scenario_samples = scenario_predict_local(
-        model_path="timevae_ctvae_prior.pth",
+        model_path=MODEL_PATH,
         X_last=X[-1],
         cond_true=C[-1],
         cond_scenario=scenario_cond_scaled,
@@ -249,9 +350,8 @@ if __name__ == "__main__":
 
     print("=========== Completed 1st! ===========")
 
-    # 1) Rolling forecast (파란선)
     forecast_full = rolling_posterior_forecast(
-        "timevae_ctvae_prior.pth",
+        MODEL_PATH,
         X,
         C,
         latent_dim=LATENT_DIM,
@@ -265,9 +365,8 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
-    # 2) 마지막 시점 posterior-scenario (빨간선)
     samples_posterior = posterior_scenario(
-        model_path="timevae_ctvae_prior.pth",
+        model_path=MODEL_PATH,
         X_last=X[-1],
         C_last=C[-1],
         latent_dim=LATENT_DIM,
@@ -283,10 +382,8 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
-    # 3) true 전체 시계열 (각 chunk의 첫 y가 true future 1-step)
     true_full = Y[:, 0, :]
 
-    # 4) Plot (scenario는 “scenario_predict_local” 결과로)
     plot_full_forecast_and_scenario(
         true_full=true_full,                 # (N, D)
         forecast_full=forecast_full,         # (N, D)
@@ -305,9 +402,8 @@ if __name__ == "__main__":
     for k, v in point_metrics.items():
         print(f"{k} : {v}")
 
-    # ✅ FIXED: NLL eval should match macro_feature_indices too
     nll_metrics = evaluate_student_t_nll(
-        model_path="timevae_ctvae_prior.pth",
+        model_path=MODEL_PATH,
         X=X,
         Y=Y,
         C=C,
@@ -348,6 +444,17 @@ if __name__ == "__main__":
     print(f"CRPS_mean: {crps['CRPS_mean']:.4f}")
     print("CRPS_per_h:", np.round(crps["CRPS_per_h"], 4))
 
+    # ✅ CRPS 터지는 horizon 자동 진단 (h=5~6 같은 애들 바로 잡힘)
+    feat_name = FEATURE_NAMES[0] if len(FEATURE_NAMES) > 0 else "feature0"
+    diagnose_crps_horizons(
+        scenario_samples=scenario_samples,
+        true_future=Y[-1],
+        feature_index=0,
+        feature_name=feat_name,
+        qs=(10, 50, 90),
+        topk=4,
+    )
+
     current_level_scaled = X[-1][-1, :]  # scaled current level
 
     risk = compute_risk_metrics(
@@ -363,40 +470,13 @@ if __name__ == "__main__":
     print("=== Risk Metrics ===")
     for k, v in risk.items():
         print(f"{k}: {v}")
-        
-def debug_last_step_distribution(model, X, C, macro_feature_indices, Y=None, tag=""):
-    device = next(model.parameters()).device
-    x = torch.tensor(X[-1:]).float().to(device)          # (1,L,D)
-    c = torch.tensor(C[-1:]).float().to(device)          # (1,cond_dim)
-    macro_x = x[:, :, macro_feature_indices].permute(0, 2, 1)  # (1,macro_dim,L)
 
-    with torch.no_grad():
-        mu_q, logvar_q = model.encoder(x, c)
-        zq = mu_q
-        mean_q, dist_q = model.decoder(zq, c)
-
-        # prior 쪽도 비교(shift가 먹는지)
-        z_macro_out = model.macro_encoder(macro_x)
-        z_macro = z_macro_out[0] if isinstance(z_macro_out, (tuple, list)) else z_macro_out
-        mu_p, logvar_p = model.prior(c, z_macro)
-        zp = mu_p
-        mean_p, dist_p = model.decoder(zp, c)
-
-        def _stat(name, dist):
-            df = dist.df.detach().cpu().numpy().ravel()
-            sc = dist.scale.detach().cpu().numpy().ravel()
-            print(f"[{tag}] {name}: df median={np.median(df):.2f} (p10={np.percentile(df,10):.2f}, p90={np.percentile(df,90):.2f}) | "
-                  f"scale median={np.median(sc):.4f} (p10={np.percentile(sc,10):.4f}, p90={np.percentile(sc,90):.4f})")
-
-        print(f"[{tag}] ||mu_q-mu_p||_2 =", float(torch.norm(mu_q - mu_p, p=2)))
-        print(f"[{tag}] mean(std_q) =", float(torch.exp(0.5*logvar_q).mean()))
-        _stat("posterior(z=mu_q)", dist_q)
-        _stat("prior(z=mu_p)", dist_p)
-
-        if Y is not None:
-            y = torch.tensor(Y[-1:]).float().to(device)
-            nll_q = -dist_q.log_prob(y).mean().item()
-            nll_p = -dist_p.log_prob(y).mean().item()
-            print(f"[{tag}] NLL using z=mu_q: {nll_q:.4f} | using z=mu_p: {nll_p:.4f}")
-
-debug_last_step_distribution(model, X, C, macro_feature_indices, Y=Y, tag="LAST")
+    # ✅ 여기서 호출해야 NameError 안 남 (model/X/C/Y가 이미 존재함)
+    debug_last_step_distribution(
+        model=model,
+        X_last=X[-1],
+        C_last=C[-1],
+        macro_feature_indices=macro_feature_indices,
+        Y_last=Y[-1],
+        tag="LAST"
+    )
