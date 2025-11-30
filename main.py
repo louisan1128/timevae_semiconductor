@@ -1,7 +1,7 @@
 # ===========================================
 # main.py — 전체 파이프라인 실행 (FIXED)
 # ===========================================
-
+import torch
 import numpy as np
 import pandas as pd
 
