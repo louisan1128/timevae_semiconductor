@@ -27,29 +27,35 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx], self.c[idx]
-        
-    def create_dataset(df_scaled, L, H, cond_cols):
-        X, Y, C = [], [], []
-        values = df_scaled.values
-        total_len = len(df_scaled)
-    
-        for start in range(total_len - L - H):
-            end_x = start + L
-            end_y = end_x + H
-    
-            x = values[start:end_x]
-            y = values[end_x:end_y]
-            c = df_scaled.iloc[end_x-1][cond_cols].values
-    
-            X.append(x)
-            Y.append(y)
-            C.append(c)
-    
-        return (
-            np.array(X, dtype=np.float32),
-            np.array(Y, dtype=np.float32),
-            np.array(C, dtype=np.float32)
-        )
+
+# -------------------------------
+# Create Dataset (Sliding Window)
+# -------------------------------
+def create_dataset(df_scaled, L, H, cond_cols):
+    X, Y, C = [], [], []
+    total_len = len(df_scaled)
+
+    for start in range(total_len - L - H):
+        end_x = start + L
+        end_y = end_x + H
+
+        x = df_scaled.iloc[start:end_x].values      # (L,D)
+        y = df_scaled.iloc[end_x:end_y].values      # (H,D)
+        c = df_scaled.iloc[end_x - 1][cond_cols].values  # (cond_dim,)
+
+        X.append(x)
+        Y.append(y)
+        C.append(c)
+
+    return (
+        np.array(X, dtype=np.float32),
+        np.array(Y, dtype=np.float32),
+        np.array(C, dtype=np.float32),
+    )
+
+
+
+
 
 # -------------------------------
 # Preprocess (Load CSV → Scaling)
@@ -114,7 +120,7 @@ def preprocess(csv_path, macro_csv_path, condition_raw_cols, macro_cols, L, H):
     
     
     # 9) Sliding window 만들기
-    X, Y, C, Dates= create_dataset(df_scaled, L, H, condition_raw_cols)
+    X, Y, C = create_dataset(df_scaled, L, H, condition_raw_cols)
 
     print("X shape:", X.shape)  # (N,L,D)
     print("Y shape:", Y.shape)  # (N,H,D)
@@ -122,7 +128,7 @@ def preprocess(csv_path, macro_csv_path, condition_raw_cols, macro_cols, L, H):
     print("macro_feature_indices:", macro_feature_indices)
     
 
-    return X, Y, C, Dates, scaler, df_raw, df_scaled, macro_feature_indices
+    return X, Y, C, scaler, df_raw, df_scaled, macro_feature_indices
 
 
 
