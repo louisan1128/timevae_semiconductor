@@ -412,7 +412,27 @@ if __name__ == "__main__":
     print("CRPS_mean:", res["CRPS_mean"])
     print("CRPS_per_h:", np.round(res["CRPS_per_h"], 4))
     # X: (N,36,D)
-# Y: (N,12,D)
+    # Y: (N,12,D)
 
-
+    # =======================================
+    # ARIMA Baseline
+    # =======================================
+    print("========== ARIMA Baseline ==========")
+    
+    from baseline_arima import arima_baseline
+    
+    arima_res = arima_baseline(
+        X=X,
+        Y=Y,
+        target_index=0,
+        L=L,
+        H=H
+    )
+    
+    print(f"ARIMA RMSE : {arima_res['RMSE']:.4f}")
+    print(f"ARIMA NLL  : {arima_res['NLL']:.4f}")
+    print(f"ARIMA CRPS : {arima_res['CRPS']:.4f}")
+    print("====================================")
+    
+    
 
