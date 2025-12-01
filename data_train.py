@@ -28,10 +28,10 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx], self.c[idx]
 # -------------------------------
-# Create Dataset (Sliding Window + Date)
+# Create Dataset (Sliding Window)
 # -------------------------------
 def create_dataset(df_scaled, L, H, cond_cols):
-    X, Y, C, Dates = [], [], [], []
+    X, Y, C = [], [], []
     total_len = len(df_scaled)
     
 
@@ -47,7 +47,6 @@ def create_dataset(df_scaled, L, H, cond_cols):
         X.append(x)
         Y.append(y)
         C.append(c)
-        Dates.append(date)
 
     return (
         np.array(X, dtype=np.float32),
