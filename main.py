@@ -466,5 +466,40 @@ if __name__ == "__main__":
     print("CRPS_per_h:", np.round(lstm_res['CRPS_per_h'], 4))
 
     
-        
+            
+    from baseline_cvae_vanilla import (
+        train_model_vanilla,
+        rolling_forward_cvae
+    )
+    
+    print("========== Train Vanilla cVAE ==========")
+    train_model_vanilla(
+        X, Y, C,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H_len=H,
+        L=L,
+        lr=LR,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        beta=BETA,
+        device=DEVICE,
+        save_path="cvae_vanilla.pth"
+    )
+    
+    print("========== Evaluate Vanilla cVAE ==========")
+    res_cvae = rolling_forward_cvae(
+        model_path="cvae_vanilla.pth",
+        X=X, Y=Y, C=C,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        L=L,
+        beta=BETA,
+        device=DEVICE
+    )
+    
+    print(res_cvae)
 
