@@ -473,8 +473,8 @@ if __name__ == "__main__":
 # X: (N,36,D)
 # Y: (N,12,D)
 
-arima_result = rolling_forward_arima(X, Y, order=(1,1,1))
-print(arima_result)
+    arima_result = rolling_forward_arima(X, Y, order=(1,1,1))
+    print(arima_result)
 
 
 
