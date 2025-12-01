@@ -27,27 +27,30 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx], self.c[idx]
-def create_dataset(df_scaled, L, H, cond_cols):
-    X, Y, C = [], [], []
-    total_len = len(df_scaled)
+        
+    def create_dataset(df_scaled, L, H, cond_cols):
+        X, Y, C = [], [], []
+        values = df_scaled.values
+        total_len = len(df_scaled)
+    
+        for start in range(total_len - L - H):
+            end_x = start + L
+            end_y = end_x + H
+    
+            x = values[start:end_x]
+            y = values[end_x:end_y]
+            c = df_scaled.iloc[end_x-1][cond_cols].values
+    
+            X.append(x)
+            Y.append(y)
+            C.append(c)
+    
+        return (
+            np.array(X, dtype=np.float32),
+            np.array(Y, dtype=np.float32),
+            np.array(C, dtype=np.float32)
+        )
 
-    for start in range(total_len - L - H):
-        end_x = start + L
-        end_y = end_x + H
-
-        x = df_scaled.iloc[start:end_x].values
-        y = df_scaled.iloc[end_x:end_y].values
-        c = df_scaled.iloc[end_x - 1][cond_cols].values
-
-        X.append(x)
-        Y.append(y)
-        C.append(c)
-
-    return (
-        np.array(X, dtype=np.float32),
-        np.array(Y, dtype=np.float32),
-        np.array(C, dtype=np.float32)
-    )
 # -------------------------------
 # Preprocess (Load CSV → Scaling)
 # -------------------------------
