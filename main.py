@@ -436,8 +436,8 @@ if __name__ == "__main__":
 
     # =======================================
     # LSTM Baseline
-    # =======================================
-    from baseline_lstm import train_lstm_once, rolling_forward_lstm
+    # ======================================
+    from baseline_lstm_rolling import train_lstm_once, rolling_forward_lstm
     
     print("========== LSTM Rolling-Forward Baseline ==========")
     
@@ -464,7 +464,7 @@ if __name__ == "__main__":
     print(f"LSTM (rolling) NLL  : {lstm_res['NLL_mean']:.4f}")
     print(f"LSTM (rolling) CRPS : {lstm_res['CRPS_mean']:.4f}")
     print("CRPS_per_h:", np.round(lstm_res['CRPS_per_h'], 4))
-    
+
     
         
 
