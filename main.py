@@ -85,7 +85,7 @@ if __name__ == "__main__":
 
     print("========== 1) Preprocessing ==========")
 
-    X, Y, C, Dates, scaler, df_raw, df_scaled, macro_feature_indices = preprocess(
+    X, Y, C, scaler, df_raw, df_scaled, macro_feature_indices = preprocess(
         csv_path="data.csv",
         macro_csv_path="macro.csv",
         condition_raw_cols=condition_raw_cols,
