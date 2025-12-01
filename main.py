@@ -469,7 +469,8 @@ if __name__ == "__main__":
     print(f"LSTM (rolling) NLL  : {lstm_res['NLL_mean']:.4f}")
     print(f"LSTM (rolling) CRPS : {lstm_res['CRPS_mean']:.4f}")
     print("CRPS_per_h:", np.round(lstm_res['CRPS_per_h'], 4))
-
+    print(f"LSTM Coverage_80%  : {lstm_res['Coverage_80%']:.4f}")
+    print(f"LSTM Sharpness_80% : {lstm_res['Sharpness_80%']:.4f}")
 
     
             
