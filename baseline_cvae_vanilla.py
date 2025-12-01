@@ -181,3 +181,84 @@ def train_model_vanilla(
 
     torch.save(model.state_dict(), save_path)
     return model
+
+###############################################
+# Rolling-Forward Evaluation (weak cVAE)
+###############################################
+def rolling_forward_cvae(
+    model_path,
+    X, Y, C,
+    latent_dim, cond_dim, hidden,
+    H, L, beta,
+    device="cuda"
+):
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    N, L_, D = X.shape
+
+    model = CVAE(
+        x_dim=D, cond_dim=cond_dim, latent_dim=latent_dim, hidden=hidden,
+        H=H, D=D, L=L
+    ).to(device)
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    preds, trues = [], []
+    nlls, crps_list = [], []
+    coverage_list, sharpness_list = [], []
+
+    for i in range(N):
+        x = torch.tensor(X[i:i+1], dtype=torch.float32, device=device)
+        y = torch.tensor(Y[i:i+1], dtype=torch.float32, device=device)
+        c = torch.tensor(C[i:i+1], dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            mu_dec, var_dec, _, _, _, _ = model(x, c)
+
+        p = mu_dec.cpu().numpy()[0]        # (H, D)
+        v = var_dec.cpu().numpy()[0]
+        sigma = np.sqrt(v)
+        t = y.cpu().numpy()[0]
+
+        preds.append(p)
+        trues.append(t)
+
+        # ---------- NLL ----------
+        nll = 0.5 * (np.log(2 * np.pi * sigma**2) + (t - p)**2 / (sigma**2))
+        nlls.append(float(np.mean(nll)))
+
+        # ---------- CRPS ----------
+        z = (t - p) / sigma
+        crps = sigma * (
+            z * (2 * norm.cdf(z) - 1) + 
+            2 * norm.pdf(z) - 1 / np.sqrt(np.pi)
+        )
+        crps_list.append(np.mean(crps))
+
+        # ---------- Coverage 80% ----------
+        z_low = norm.ppf(0.10)
+        z_up  = norm.ppf(0.90)
+
+        lower = p + sigma * z_low
+        upper = p + sigma * z_up
+
+        inside = (t >= lower) & (t <= upper)
+        coverage_list.append(float(inside.mean()))
+
+        sharpness_list.append(float((upper - lower).mean()))
+
+    preds = np.array(preds)
+    trues = np.array(trues)
+
+    rmse = float(np.sqrt(np.mean((preds - trues)**2)))
+
+    return {
+        "preds": preds,
+        "trues": trues,
+        "RMSE": rmse,
+        "NLL_mean": float(np.mean(nlls)),
+        "CRPS_mean": float(np.mean(crps_list)),
+        "Coverage_80%": float(np.mean(coverage_list)),
+        "Sharpness_80%": float(np.mean(sharpness_list)),
+    }
+
