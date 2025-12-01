@@ -507,6 +507,10 @@ if __name__ == "__main__":
         beta=BETA,
         device=DEVICE
     )
-    
-    print(res_cvae)
-
+        
+    print("========== Vanilla cVAE Baseline ==========")
+    print(f"RMSE          : {res_cvae['RMSE']:.4f}")
+    print(f"NLL_mean      : {res_cvae['NLL_mean']:.4f}")
+    print(f"CRPS_mean     : {res_cvae['CRPS_mean']:.4f}")
+    print(f"Coverage_80%  : {res_cvae['Coverage_80%']:.4f}")
+    print(f"Sharpness_80% : {res_cvae['Sharpness_80%']:.4f}")
