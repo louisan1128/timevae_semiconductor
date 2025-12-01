@@ -413,6 +413,7 @@ if __name__ == "__main__":
     print("CRPS_per_h:", np.round(res["CRPS_per_h"], 4))
     print("Coverage_80%:", res["Coverage_80%"])
     print("Sharpness_80%:", res["Sharpness_80%"])
+    print("CVaR_10%:", res["CVaR_10%"])
     # X: (N,36,D)
     # Y: (N,12,D)
 
@@ -514,3 +515,4 @@ if __name__ == "__main__":
     print(f"CRPS_mean     : {res_cvae['CRPS_mean']:.4f}")
     print(f"Coverage_80%  : {res_cvae['Coverage_80%']:.4f}")
     print(f"Sharpness_80% : {res_cvae['Sharpness_80%']:.4f}")
+    print("CVaR_10%     :", res_cvae["CVaR_10%"])
