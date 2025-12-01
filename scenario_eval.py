@@ -1003,3 +1003,14 @@ def rolling_forward_backtest(
             "crps_feature_index": int(crps_feature_index),
         }
     }
+
+def compute_cvar(return_samples, alpha=0.10):
+    # return_samples: shape (num_samples,)
+    var_alpha = np.quantile(return_samples, alpha)
+
+    tail = return_samples[return_samples <= var_alpha]
+    if len(tail) == 0:
+        return var_alpha  # fallback
+
+    return tail.mean()   # CVaR(10%)
+
