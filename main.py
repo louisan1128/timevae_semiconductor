@@ -5,65 +5,6 @@
 import numpy as np
 from statsmodels.tsa.arima.model import ARIMA
 
-def rolling_forward_arima(
-    X, Y,
-    order=(1,1,1),
-    verbose=False
-):
-    """
-    X: (N, L, D)
-    Y: (N, H, D)
-    """
-    X = np.asarray(X)
-    Y = np.asarray(Y)
-
-    N, L, D = X.shape
-    H = Y.shape[1]
-
-    sse = 0.0
-    sae = 0.0
-    n_elem = 0
-
-    for i in range(N):
-        x_win = X[i]        # (L, D)
-        y_true = Y[i]       # (H, D)
-
-        preds = np.zeros((H, D))
-
-        for d in range(D):
-            series = x_win[:, d]   # length L
-
-            # fit ARIMA
-            try:
-                model = ARIMA(series, order=order)
-                model_fit = model.fit()
-                forecast = model_fit.forecast(steps=H)
-                preds[:, d] = forecast
-            except:
-                # fallback: naive last value
-                preds[:, d] = series[-1]
-
-        # accumulate RMSE/MAE
-        diff = preds - y_true
-        sse += np.sum(diff**2)
-        sae += np.sum(np.abs(diff))
-        n_elem += diff.size
-
-        if verbose and i % 20 == 0:
-            print(f"[ARIMA] Anchor {i}/{N}")
-
-    mse = sse / n_elem
-    rmse = np.sqrt(mse)
-    mae = sae / n_elem
-
-    return {
-        "RMSE": float(rmse),
-        "MAE": float(mae),
-        "MSE": float(mse),
-        "NLL_mean": None,
-        "CRPS_mean": None,
-        "CRPS_per_h": None,
-    }
 
 
 from data_train import (
@@ -470,11 +411,7 @@ if __name__ == "__main__":
     print("NLL_mean:", res["NLL_mean"])
     print("CRPS_mean:", res["CRPS_mean"])
     print("CRPS_per_h:", np.round(res["CRPS_per_h"], 4))
-
-
-    arima_result = rolling_forward_arima(X, Y, order=(1,1,1))
-    print(arima_result)
-# X: (N,36,D)
+    # X: (N,36,D)
 # Y: (N,12,D)
 
 
