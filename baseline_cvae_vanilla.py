@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-from torch.distributions import StudentT
 from scipy.stats import norm
 
 
@@ -64,7 +63,7 @@ class ConditionalPrior(nn.Module):
 
 
 ###############################################
-#  Decoder (Student-t)
+#  Decoder (Gaussian)
 ###############################################
 class Decoder(nn.Module):
     def __init__(self, latent_dim, cond_dim, hidden, H, D):
@@ -72,8 +71,7 @@ class Decoder(nn.Module):
         self.fc1 = nn.Linear(latent_dim + cond_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.mu = nn.Linear(hidden, H * D)
-        self.log_scale = nn.Linear(hidden, H * D)
-        self.df = nn.Parameter(torch.tensor(5.0))
+        self.logvar = nn.Linear(hidden, H * D)
         self.H = H
         self.D = D
 
@@ -81,10 +79,12 @@ class Decoder(nn.Module):
         inp = torch.cat([z, c], dim=1)
         h = F.relu(self.fc1(inp))
         h = F.relu(self.fc2(h))
+
         mu = self.mu(h).reshape(-1, self.H, self.D)
-        scale = torch.exp(self.log_scale(h)).reshape(-1, self.H, self.D) + 1e-6
-        dist = StudentT(df=self.df, loc=mu, scale=scale)
-        return mu, dist
+        logvar = self.logvar(h).reshape(-1, self.H, self.D)
+        var = torch.exp(logvar) + 1e-6
+
+        return mu, var
 
 
 ###############################################
@@ -102,9 +102,11 @@ class CVAE(nn.Module):
         std_q = torch.exp(0.5 * logvar_q)
         eps = torch.randn_like(std_q)
         z = mu_q + eps * std_q
+
         mu_p, logvar_p = self.prior(c)
-        mu_dec, dist = self.decoder(z, c)
-        return mu_dec, dist, mu_q, logvar_q, mu_p, logvar_p
+        mu_dec, var_dec = self.decoder(z, c)
+
+        return mu_dec, var_dec, mu_q, logvar_q, mu_p, logvar_p
 
 
 ###############################################
@@ -150,9 +152,12 @@ def train_model_vanilla(
             c = c.float().to(device)
 
             opt.zero_grad()
-            mu_dec, dist, mu_q, logvar_q, mu_p, logvar_p = model(x, c)
+            mu_dec, var_dec, mu_q, logvar_q, mu_p, logvar_p = model(x, c)
 
-            recon = -dist.log_prob(y).mean()
+            # Gaussian NLL
+            recon = 0.5 * (torch.log(var_dec) + (y - mu_dec)**2 / var_dec)
+            recon = recon.mean()
+
             kl_loss = kl(mu_q, logvar_q, mu_p, logvar_p)
             loss = recon + beta * kl_loss
 
@@ -168,25 +173,18 @@ def train_model_vanilla(
 
 
 ###############################################
-#  Rolling-Forward eval (same style as LSTM/ARIMA)
-###############################################
-###############################################
-#  Rolling-Forward eval (probabilistic, scenario-based)
+#  Rolling-Forward Evaluation
 ###############################################
 def rolling_forward_cvae(
     model_path,
     X, Y, C,
     latent_dim, cond_dim, hidden,
     H, L, beta,
-    device="cuda",
-    num_samples=500,        # scenario sample 개수
-    lower_q=10, upper_q=90, # coverage band
-    feature_index=0         # 평가 feature
+    device="cuda"
 ):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     N, L_, D = X.shape
 
-    # ---------------- Load model ----------------
     model = CVAE(
         x_dim=D, cond_dim=cond_dim, latent_dim=latent_dim, hidden=hidden,
         H=H, D=D, L=L
@@ -194,15 +192,9 @@ def rolling_forward_cvae(
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    # ---------------- Accumulators ----------------
     preds, trues = [], []
-    rmse_sse = 0.0
-    rmse_count = 0
-
-    nll_list = []
+    nlls = []
     crps_list = []
-    cov_list = []
-    sharp_list = []
 
     for i in range(N):
         x = torch.tensor(X[i:i+1], dtype=torch.float32, device=device)
@@ -210,71 +202,35 @@ def rolling_forward_cvae(
         c = torch.tensor(C[i:i+1], dtype=torch.float32, device=device)
 
         with torch.no_grad():
-            mu_dec, dist, _, _, _, _ = model(x, c)
+            mu_dec, var_dec, _, _, _, _ = model(x, c)
 
-        # (1,H,D)
-        mu_np = mu_dec.cpu().numpy()[0]
-        y_np  = y.cpu().numpy()[0]
-        preds.append(mu_np)
-        trues.append(y_np)
+        p = mu_dec.cpu().numpy()[0]        # (H, D)
+        t = y.cpu().numpy()[0]
+        preds.append(p)
+        trues.append(t)
 
-        # ---------------- RMSE ----------------
-        diff = mu_np - y_np
-        rmse_sse += np.sum(diff**2)
-        rmse_count += diff.size
+        sigma = np.sqrt(var_dec.cpu().numpy()[0])
 
-        # ---------------- NLL ----------------
-        nll_val = float(-dist.log_prob(y).mean().cpu().item())
-        nll_list.append(nll_val)
+        # NLL
+        nll = 0.5 * (np.log(2 * np.pi * sigma**2) + (t - p)**2 / (sigma**2))
+        nlls.append(float(np.mean(nll)))
 
-        # ---------------- Scenario Sampling: Student-t samples ----------------
-        # dist: StudentT(df, loc=mu_dec, scale=scale)
-        with torch.no_grad():
-            samples = dist.rsample((num_samples,))  # (M,1,H,D)
-        samples = samples.squeeze(1).cpu().numpy()  # (M,H,D)
+        # Gaussian CRPS
+        z = (t - p) / sigma
+        crps = sigma * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi))
+        crps_list.append(np.mean(crps))
 
-        # ---------------- CRPS (one feature) ----------------
-        S = samples[:, :, feature_index]   # (M,H)
-        y_f = y_np[:, feature_index]       # (H,)
+    preds = np.array(preds)
+    trues = np.array(trues)
 
-        # CRPS = E|S − y| - 1/2 E|S − S'|
-        M = S.shape[0]
-        term1 = np.mean(np.abs(S - y_f[None,:]), axis=0)
-
-        # E|S - S'|
-        S1 = S[:,None,:]
-        S2 = S[None,:,:]
-        term2 = np.mean(np.abs(S1 - S2), axis=(0,1))
-
-        crps_h = term1 - 0.5 * term2
-        crps_list.append(np.mean(crps_h))
-
-        # ---------------- Coverage & Sharpness ----------------
-        lower = np.percentile(S, lower_q, axis=0)
-        upper = np.percentile(S, upper_q, axis=0)
-
-        inside = (y_f >= lower) & (y_f <= upper)
-        coverage_i = inside.mean()
-        sharp_i = (upper - lower).mean()
-
-        cov_list.append(coverage_i)
-        sharp_list.append(sharp_i)
-
-    # ---------------- Final Aggregation ----------------
-    rmse = float(np.sqrt(rmse_sse / rmse_count))
-    nll = float(np.mean(nll_list))
+    rmse = float(np.sqrt(np.mean((preds - trues)**2)))
+    nll = float(np.mean(nlls))
     crps = float(np.mean(crps_list))
-    coverage = float(np.mean(cov_list))
-    sharpness = float(np.mean(sharp_list))
 
     return {
-        "preds": np.array(preds),
-        "trues": np.array(trues),
+        "preds": preds,
+        "trues": trues,
         "RMSE": rmse,
         "NLL_mean": nll,
         "CRPS_mean": crps,
-        "Coverage_80%": coverage,
-        "Sharpness_80%": sharpness,
     }
-
-
