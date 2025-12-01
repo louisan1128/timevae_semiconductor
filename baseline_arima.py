@@ -42,7 +42,7 @@ def arima_baseline(X, Y, target_index=0, L=36, H=12):
     for i in range(N):
         train_data = full_series[:(i + L)]
 
-        model = ARIMA(train_data, order=(1,1,1)).fit()
+        model = ARIMA(train_data, order=(1,1,0)).fit()
 
         # σ: residual std
         sigma = np.std(model.resid) + 1e-6
@@ -73,3 +73,4 @@ def arima_baseline(X, Y, target_index=0, L=36, H=12):
         "NLL": float(np.mean(nll_list)),
         "CRPS": float(np.mean(crps_list)),
     }
+
