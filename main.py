@@ -411,6 +411,8 @@ if __name__ == "__main__":
     print("NLL_mean:", res["NLL_mean"])
     print("CRPS_mean:", res["CRPS_mean"])
     print("CRPS_per_h:", np.round(res["CRPS_per_h"], 4))
+    print("Coverage_80%:", res["Coverage_80%"])
+    print("Sharpness_80%:", res["Sharpness_80%"])
     # X: (N,36,D)
     # Y: (N,12,D)
 
@@ -464,8 +466,7 @@ if __name__ == "__main__":
     print(f"LSTM (rolling) NLL  : {lstm_res['NLL_mean']:.4f}")
     print(f"LSTM (rolling) CRPS : {lstm_res['CRPS_mean']:.4f}")
     print("CRPS_per_h:", np.round(lstm_res['CRPS_per_h'], 4))
-    print("Coverage_80%:", res["Coverage_80%"])
-    print("Sharpness_80%:", res["Sharpness_80%"])
+
 
     
             
