@@ -34,7 +34,6 @@ def create_dataset(df_scaled, L, H, cond_cols):
     X, Y, C, Dates = [], [], [], []
     total_len = len(df_scaled)
     
-    dates = df_scaled.index.to_numpy()   # 날짜 배열 추출
 
     for start in range(total_len - L - H):
         end_x = start + L
@@ -44,7 +43,6 @@ def create_dataset(df_scaled, L, H, cond_cols):
         y = df_scaled.iloc[end_x:end_y].values
         c = df_scaled.iloc[end_x - 1][cond_cols].values
 
-        date = dates[end_x - 1]
 
         X.append(x)
         Y.append(y)
@@ -55,7 +53,6 @@ def create_dataset(df_scaled, L, H, cond_cols):
         np.array(X, dtype=np.float32),
         np.array(Y, dtype=np.float32),
         np.array(C, dtype=np.float32),
-        np.array(Dates)
     )
 
 
