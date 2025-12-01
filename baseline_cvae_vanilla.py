@@ -170,16 +170,23 @@ def train_model_vanilla(
 ###############################################
 #  Rolling-Forward eval (same style as LSTM/ARIMA)
 ###############################################
+###############################################
+#  Rolling-Forward eval (probabilistic, scenario-based)
+###############################################
 def rolling_forward_cvae(
     model_path,
     X, Y, C,
     latent_dim, cond_dim, hidden,
     H, L, beta,
-    device="cuda"
+    device="cuda",
+    num_samples=500,        # scenario sample 개수
+    lower_q=10, upper_q=90, # coverage band
+    feature_index=0         # 평가 feature
 ):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     N, L_, D = X.shape
 
+    # ---------------- Load model ----------------
     model = CVAE(
         x_dim=D, cond_dim=cond_dim, latent_dim=latent_dim, hidden=hidden,
         H=H, D=D, L=L
@@ -187,9 +194,15 @@ def rolling_forward_cvae(
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
+    # ---------------- Accumulators ----------------
     preds, trues = [], []
-    nlls = []
+    rmse_sse = 0.0
+    rmse_count = 0
+
+    nll_list = []
     crps_list = []
+    cov_list = []
+    sharp_list = []
 
     for i in range(N):
         x = torch.tensor(X[i:i+1], dtype=torch.float32, device=device)
@@ -199,31 +212,69 @@ def rolling_forward_cvae(
         with torch.no_grad():
             mu_dec, dist, _, _, _, _ = model(x, c)
 
-        p = mu_dec.cpu().numpy()[0]        # (H,D)
-        t = y.cpu().numpy()[0]             # (H,D)
-        preds.append(p)
-        trues.append(t)
+        # (1,H,D)
+        mu_np = mu_dec.cpu().numpy()[0]
+        y_np  = y.cpu().numpy()[0]
+        preds.append(mu_np)
+        trues.append(y_np)
 
-        # NLL
-        nlls.append(float(-dist.log_prob(y).mean().cpu().item()))
+        # ---------------- RMSE ----------------
+        diff = mu_np - y_np
+        rmse_sse += np.sum(diff**2)
+        rmse_count += diff.size
 
-        # CRPS (Gaussian approx)
-        sigma = np.std(p - t) + 1e-6
-        z = (t - p) / sigma
-        crps = sigma * (z*(2*norm.cdf(z)-1) + 2*norm.pdf(z) - 1/np.sqrt(np.pi))
-        crps_list.append(np.mean(crps))
+        # ---------------- NLL ----------------
+        nll_val = float(-dist.log_prob(y).mean().cpu().item())
+        nll_list.append(nll_val)
 
-    preds = np.array(preds)
-    trues = np.array(trues)
+        # ---------------- Scenario Sampling: Student-t samples ----------------
+        # dist: StudentT(df, loc=mu_dec, scale=scale)
+        with torch.no_grad():
+            samples = dist.rsample((num_samples,))  # (M,1,H,D)
+        samples = samples.squeeze(1).cpu().numpy()  # (M,H,D)
 
-    rmse = float(np.sqrt(np.mean((preds - trues)**2)))
-    nll = float(np.mean(nlls))
+        # ---------------- CRPS (one feature) ----------------
+        S = samples[:, :, feature_index]   # (M,H)
+        y_f = y_np[:, feature_index]       # (H,)
+
+        # CRPS = E|S − y| - 1/2 E|S − S'|
+        M = S.shape[0]
+        term1 = np.mean(np.abs(S - y_f[None,:]), axis=0)
+
+        # E|S - S'|
+        S1 = S[:,None,:]
+        S2 = S[None,:,:]
+        term2 = np.mean(np.abs(S1 - S2), axis=(0,1))
+
+        crps_h = term1 - 0.5 * term2
+        crps_list.append(np.mean(crps_h))
+
+        # ---------------- Coverage & Sharpness ----------------
+        lower = np.percentile(S, lower_q, axis=0)
+        upper = np.percentile(S, upper_q, axis=0)
+
+        inside = (y_f >= lower) & (y_f <= upper)
+        coverage_i = inside.mean()
+        sharp_i = (upper - lower).mean()
+
+        cov_list.append(coverage_i)
+        sharp_list.append(sharp_i)
+
+    # ---------------- Final Aggregation ----------------
+    rmse = float(np.sqrt(rmse_sse / rmse_count))
+    nll = float(np.mean(nll_list))
     crps = float(np.mean(crps_list))
+    coverage = float(np.mean(cov_list))
+    sharpness = float(np.mean(sharp_list))
 
     return {
-      
+        "preds": np.array(preds),
+        "trues": np.array(trues),
         "RMSE": rmse,
         "NLL_mean": nll,
         "CRPS_mean": crps,
+        "Coverage_80%": coverage,
+        "Sharpness_80%": sharpness,
     }
+
 
