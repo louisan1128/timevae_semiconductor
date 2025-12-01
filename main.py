@@ -50,7 +50,7 @@ HIDDEN = 128
 POLY_ORDER = 2
 N_FOURIER = 3
 
-BETA = 0.8
+BETA = 1.0
 LR = 1e-3
 EPOCHS = 150         # rolling forward 재학습 시 epoch 많으면 오래 걸림
 BATCH_SIZE = 32
