@@ -27,11 +27,7 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx], self.c[idx]
-
 # -------------------------------
-# Create Dataset (Sliding Window)
-# -------------------------------
-def# -------------------------------
 # Create Dataset (Sliding Window + Date)
 # -------------------------------
 def create_dataset(df_scaled, L, H, cond_cols):
@@ -44,13 +40,11 @@ def create_dataset(df_scaled, L, H, cond_cols):
         end_x = start + L
         end_y = end_x + H
 
-        # 기존 입력/출력/컨디션
-        x = df_scaled.iloc[start:end_x].values       # (L,D)
-        y = df_scaled.iloc[end_x:end_y].values       # (H,D)
-        c = df_scaled.iloc[end_x - 1][cond_cols].values  # (cond_dim,)
+        x = df_scaled.iloc[start:end_x].values
+        y = df_scaled.iloc[end_x:end_y].values
+        c = df_scaled.iloc[end_x - 1][cond_cols].values
 
-        # 이 윈도우의 대표 날짜(예측 시작 시점)
-        date = dates[end_x - 1]   # 슬라이딩 윈도우의 마지막 관측 시점
+        date = dates[end_x - 1]
 
         X.append(x)
         Y.append(y)
@@ -61,8 +55,9 @@ def create_dataset(df_scaled, L, H, cond_cols):
         np.array(X, dtype=np.float32),
         np.array(Y, dtype=np.float32),
         np.array(C, dtype=np.float32),
-        np.array(Dates)   # shape (N,)
+        np.array(Dates)
     )
+
 
 
 
