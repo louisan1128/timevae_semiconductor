@@ -852,6 +852,14 @@ def load_timevae_for_eval(
     model.eval()
 
     return model, device
+def compute_cvar(return_samples, alpha=0.10):
+    """CVaR(alpha): return <= VaR(alpha)의 평균"""
+    var_alpha = np.quantile(return_samples, alpha)
+    tail = return_samples[return_samples <= var_alpha]
+    if len(tail) == 0:
+        return var_alpha
+    return tail.mean()
+
 
 def rolling_forward_backtest(
     model_path,
@@ -870,18 +878,16 @@ def rolling_forward_backtest(
     seed=0,
 ):
     """
-    X: (N,L,D), Y: (N,H,D), C: (N,cond_dim)
-    rolling-forward = i=0..N-1 anchor를 순회하며 metric 누적
+    Rolling-forward evaluation
+    X: (N,L,D), Y: (N,H,D)
     """
     set_seed(seed)
 
     X = np.asarray(X); Y = np.asarray(Y); C = np.asarray(C)
     N, L, D = X.shape
-    assert Y.shape[0] == N and Y.shape[1] == H and Y.shape[2] == D
-    assert C.shape[0] == N
 
     # ------------------------------
-    # Load trained model
+    # Load model
     # ------------------------------
     model, dev = load_timevae_for_eval(
         model_path=model_path,
@@ -905,52 +911,49 @@ def rolling_forward_backtest(
     crps_sum_per_h = np.zeros(H, dtype=float)
     crps_count = 0
 
-    # --- Coverage / Sharpness ---
     coverage_sum = 0.0
     sharpness_sum = 0.0
     coverage_count = 0
 
-    # ------------------------------
-    # Rolling forward loop
-    # ------------------------------
+    # --- CVaR holder ---
+    cvar_10 = None
+
+    # ======================================================
+    # Rolling loop
+    # ======================================================
     with torch.no_grad():
         for i in range(N):
             x = torch.tensor(X[i:i+1]).float().to(dev)     # (1,L,D)
             y = torch.tensor(Y[i:i+1]).float().to(dev)     # (1,H,D)
             c = torch.tensor(C[i:i+1]).float().to(dev)     # (1,cond)
 
-            # ---- posterior mean forecast ----
+            # ---- posterior ----
             mu_q, logvar_q = model.encoder(x, c)
             mean, dist = model.decoder(mu_q, c)            # (1,H,D)
 
-            # ====== Point Forecast Metrics ======
+            # ===== Point Forecast Metrics =====
             diff = (mean - y).cpu().numpy()
-            sse += float(np.sum(diff ** 2))
+            sse += float(np.sum(diff**2))
             sae += float(np.sum(np.abs(diff)))
             n_elem += diff.size
 
-            # ====== NLL ======
-            nll = -dist.log_prob(y).mean().item()
-            nll_sum += float(nll)
+            # ===== NLL =====
+            nll_sum += -dist.log_prob(y).mean().item()
             nll_count += 1
 
-            # ====== Scenario Sampling (Posterior) ======
-            std_q = torch.exp(0.5 * logvar_q)
+            # ===== Scenario sampling =====
             M = int(num_samples)
+            std_q = torch.exp(0.5 * logvar_q)
 
             eps = torch.randn((M, latent_dim), device=dev)
-            z = mu_q.expand(M, -1) + float(z_shrink) * std_q.expand(M, -1) * eps
+            z = mu_q.expand(M, -1) + z_shrink * std_q.expand(M, -1) * eps
             c_rep = c.expand(M, -1)
 
             mean_s, dist_s = model.decoder(z, c_rep)       # (M,H,D)
-            if sample_from_student_t:
-                y_s = dist_s.rsample()
-            else:
-                y_s = mean_s
-
+            y_s = dist_s.rsample() if sample_from_student_t else mean_s
             samples = y_s.cpu().numpy()                    # (M,H,D)
 
-            # ====== CRPS ======
+            # ===== CRPS =====
             crps_per_h = crps_from_samples_fast_1feature(
                 samples_MHD=samples,
                 y_HD=Y[i],
@@ -959,17 +962,32 @@ def rolling_forward_backtest(
             crps_sum_per_h += crps_per_h
             crps_count += 1
 
-            # ====== Coverage + Sharpness (10~90% => 80% interval) ======
-            cov_info = compute_coverage_and_sharpness(
+            # ===== Coverage / Sharpness =====
+            cinfo = compute_coverage_and_sharpness(
                 scenario_samples=samples,
                 true_future=Y[i],
                 feature_index=crps_feature_index,
                 lower_q=10,
                 upper_q=90
             )
-            coverage_sum += cov_info["Coverage_80%"]
-            sharpness_sum += cov_info["Sharpness_80%"]
+            coverage_sum += cinfo["Coverage_80%"]
+            sharpness_sum += cinfo["Sharpness_80%"]
             coverage_count += 1
+
+            # ======================================================
+            # ====== CVaR(10%) — 마지막 시점에서만 계산 ======
+            # ======================================================
+            if i == N - 1:
+                # 마지막 horizon 의 scenario 값 (raw scaled)
+                y_last = samples[:, -1, crps_feature_index]     # (M,)
+
+                # 현재 시점(X[i])의 마지막 관측값
+                current = X[i][-1, crps_feature_index]          # scaler 이후 값
+
+                # scaled return
+                returns = (y_last / current) - 1.0              # (M,)
+
+                cvar_10 = float(compute_cvar(returns, alpha=0.10))
 
     # ------------------------------
     # Final Metrics
@@ -986,15 +1004,17 @@ def rolling_forward_backtest(
     coverage_final = coverage_sum / max(1, coverage_count)
     sharpness_final = sharpness_sum / max(1, coverage_count)
 
+    # ====== 반환 ======
     return {
         "RMSE": rmse,
-        "MAE": float(mae),
-        "MSE": float(mse),
-        "NLL_mean": float(nll_mean),
+        "MAE": mae,
+        "MSE": mse,
+        "NLL_mean": nll_mean,
         "CRPS_mean": crps_mean,
         "CRPS_per_h": crps_per_h,
         "Coverage_80%": coverage_final,
         "Sharpness_80%": sharpness_final,
+        "CVaR_10%": cvar_10,          # ★ 핵심 추가
         "settings": {
             "num_samples": int(num_samples),
             "z_shrink": float(z_shrink),
@@ -1004,13 +1024,4 @@ def rolling_forward_backtest(
         }
     }
 
-def compute_cvar(return_samples, alpha=0.10):
-    # return_samples: shape (num_samples,)
-    var_alpha = np.quantile(return_samples, alpha)
-
-    tail = return_samples[return_samples <= var_alpha]
-    if len(tail) == 0:
-        return var_alpha  # fallback
-
-    return tail.mean()   # CVaR(10%)
 
