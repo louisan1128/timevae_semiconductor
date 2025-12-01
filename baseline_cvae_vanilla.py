@@ -170,11 +170,6 @@ def train_model_vanilla(
 
     torch.save(model.state_dict(), save_path)
     return model
-
-
-###############################################
-#  Rolling-Forward Evaluation
-###############################################
 def rolling_forward_cvae(
     model_path,
     X, Y, C,
@@ -195,6 +190,8 @@ def rolling_forward_cvae(
     preds, trues = [], []
     nlls = []
     crps_list = []
+    coverage_list = []
+    sharpness_list = []
 
     for i in range(N):
         x = torch.tensor(X[i:i+1], dtype=torch.float32, device=device)
@@ -205,32 +202,45 @@ def rolling_forward_cvae(
             mu_dec, var_dec, _, _, _, _ = model(x, c)
 
         p = mu_dec.cpu().numpy()[0]        # (H, D)
+        v = var_dec.cpu().numpy()[0]
+        sigma = np.sqrt(v)
         t = y.cpu().numpy()[0]
+
         preds.append(p)
         trues.append(t)
 
-        sigma = np.sqrt(var_dec.cpu().numpy()[0])
-
-        # NLL
+        # ---------- NLL ----------
         nll = 0.5 * (np.log(2 * np.pi * sigma**2) + (t - p)**2 / (sigma**2))
         nlls.append(float(np.mean(nll)))
 
-        # Gaussian CRPS
+        # ---------- CRPS ----------
         z = (t - p) / sigma
         crps = sigma * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi))
         crps_list.append(np.mean(crps))
+
+        # ---------- Coverage / Sharpness ----------
+        z_low = norm.ppf(0.10)   # 10%
+        z_up  = norm.ppf(0.90)   # 90%
+
+        lower = p + sigma * z_low
+        upper = p + sigma * z_up
+
+        inside = (t >= lower) & (t <= upper)
+        coverage_list.append(float(inside.mean()))
+
+        sharpness_list.append(float((upper - lower).mean()))
 
     preds = np.array(preds)
     trues = np.array(trues)
 
     rmse = float(np.sqrt(np.mean((preds - trues)**2)))
-    nll = float(np.mean(nlls))
-    crps = float(np.mean(crps_list))
 
     return {
         "preds": preds,
         "trues": trues,
         "RMSE": rmse,
-        "NLL_mean": nll,
-        "CRPS_mean": crps,
+        "NLL_mean": float(np.mean(nlls)),
+        "CRPS_mean": float(np.mean(crps_list)),
+        "Coverage_80%": float(np.mean(coverage_list)),
+        "Sharpness_80%": float(np.mean(sharpness_list)),
     }
