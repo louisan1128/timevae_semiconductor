@@ -441,22 +441,33 @@ if __name__ == "__main__":
     
     print("========== LSTM Baseline ==========")
     
-    lstm_res = train_lstm_baseline(
+  from baseline_lstm import train_lstm_once, rolling_forward_lstm
+
+print("========== LSTM Rolling-Forward Baseline ==========")
+    lstm_model = train_lstm_once(
         X=X,
         Y=Y,
-        target_index=0,    # Export
+        target_index=0,
         H=H,
-        hidden_dim=64,
-        num_layers=2,
-        epochs=50,
-        batch_size=32,
-        lr=1e-3,
-        device=DEVICE
+        hidden=64,
+        layers=2,
+        device=DEVICE,
+        epochs=50
     )
     
-    print(f"LSTM MSE  : {lstm_res['MSE']:.4f}")
-    print(f"LSTM MAE  : {lstm_res['MAE']:.4f}")
-    print(f"LSTM RMSE : {lstm_res['RMSE']:.4f}")
+    lstm_res = rolling_forward_lstm(
+        lstm_model,
+        X=X,
+        Y=Y,
+        target_index=0,
+        H=H
+    )
+    
+    print(f"LSTM (rolling) RMSE : {lstm_res['RMSE']:.4f}")
+    print(f"LSTM (rolling) NLL  : {lstm_res['NLL_mean']:.4f}")
+    print(f"LSTM (rolling) CRPS : {lstm_res['CRPS_mean']:.4f}")
+    print("CRPS_per_h:", np.round(lstm_res['CRPS_per_h'], 4))
+
     print("====================================")
 
     
