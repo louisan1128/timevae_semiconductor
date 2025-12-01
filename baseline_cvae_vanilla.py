@@ -221,9 +221,9 @@ def rolling_forward_cvae(
     crps = float(np.mean(crps_list))
 
     return {
-        "preds": preds,
-        "trues": trues,
+      
         "RMSE": rmse,
         "NLL_mean": nll,
         "CRPS_mean": crps,
     }
+
