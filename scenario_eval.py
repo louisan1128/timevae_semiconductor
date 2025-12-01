@@ -880,6 +880,9 @@ def rolling_forward_backtest(
     assert Y.shape[0] == N and Y.shape[1] == H and Y.shape[2] == D
     assert C.shape[0] == N
 
+    # ------------------------------
+    # Load trained model
+    # ------------------------------
     model, dev = load_timevae_for_eval(
         model_path=model_path,
         out_dim=D, cond_dim=cond_dim, hidden=hidden, latent_dim=latent_dim, H=H, beta=beta,
@@ -889,7 +892,9 @@ def rolling_forward_backtest(
         macro_encoder_path=macro_encoder_path,
     )
 
-    # --- accumulators ---
+    # ------------------------------
+    # Accumulators
+    # ------------------------------
     sse = 0.0
     sae = 0.0
     n_elem = 0
@@ -900,33 +905,37 @@ def rolling_forward_backtest(
     crps_sum_per_h = np.zeros(H, dtype=float)
     crps_count = 0
 
+    # --- Coverage / Sharpness ---
+    coverage_sum = 0.0
+    sharpness_sum = 0.0
+    coverage_count = 0
+
+    # ------------------------------
+    # Rolling forward loop
+    # ------------------------------
     with torch.no_grad():
         for i in range(N):
             x = torch.tensor(X[i:i+1]).float().to(dev)     # (1,L,D)
             y = torch.tensor(Y[i:i+1]).float().to(dev)     # (1,H,D)
             c = torch.tensor(C[i:i+1]).float().to(dev)     # (1,cond)
 
-            # (macro_x는 model 내부에서 prior에 쓰일 수 있으나, 여기서는 포스터리어 경로만 사용)
-            # macro_x = x[:, :, macro_feature_indices].permute(0,2,1)
-
-            # ---- posterior mean forecast (deterministic point) ----
+            # ---- posterior mean forecast ----
             mu_q, logvar_q = model.encoder(x, c)
-            mean, dist = model.decoder(mu_q, c)            # mean: (1,H,D), dist: Student-t
+            mean, dist = model.decoder(mu_q, c)            # (1,H,D)
 
-            # RMSE/MAE (전체 H*D 평균)
+            # ====== Point Forecast Metrics ======
             diff = (mean - y).cpu().numpy()
             sse += float(np.sum(diff ** 2))
             sae += float(np.sum(np.abs(diff)))
             n_elem += diff.size
 
-            # NLL (샘플링 없이 고정)
+            # ====== NLL ======
             nll = -dist.log_prob(y).mean().item()
             nll_sum += float(nll)
             nll_count += 1
 
-            # ---- CRPS (scenario 기반) ----
-            # z 샘플링 (posterior around mu_q)
-            std_q = torch.exp(0.5 * logvar_q)              # (1,latent)
+            # ====== Scenario Sampling (Posterior) ======
+            std_q = torch.exp(0.5 * logvar_q)
             M = int(num_samples)
 
             eps = torch.randn((M, latent_dim), device=dev)
@@ -935,19 +944,36 @@ def rolling_forward_backtest(
 
             mean_s, dist_s = model.decoder(z, c_rep)       # (M,H,D)
             if sample_from_student_t:
-                y_s = dist_s.rsample()                     # (M,H,D)
+                y_s = dist_s.rsample()
             else:
                 y_s = mean_s
 
             samples = y_s.cpu().numpy()                    # (M,H,D)
+
+            # ====== CRPS ======
             crps_per_h = crps_from_samples_fast_1feature(
                 samples_MHD=samples,
-                y_HD=Y[i],                                 # (H,D)
+                y_HD=Y[i],
                 feature_index=crps_feature_index
             )
             crps_sum_per_h += crps_per_h
             crps_count += 1
 
+            # ====== Coverage + Sharpness (10~90% => 80% interval) ======
+            cov_info = compute_coverage_and_sharpness(
+                scenario_samples=samples,
+                true_future=Y[i],
+                feature_index=crps_feature_index,
+                lower_q=10,
+                upper_q=90
+            )
+            coverage_sum += cov_info["Coverage_80%"]
+            sharpness_sum += cov_info["Sharpness_80%"]
+            coverage_count += 1
+
+    # ------------------------------
+    # Final Metrics
+    # ------------------------------
     mse = sse / max(1, n_elem)
     rmse = float(np.sqrt(mse))
     mae = sae / max(1, n_elem)
@@ -957,6 +983,9 @@ def rolling_forward_backtest(
     crps_per_h = crps_sum_per_h / max(1, crps_count)
     crps_mean = float(np.mean(crps_per_h))
 
+    coverage_final = coverage_sum / max(1, coverage_count)
+    sharpness_final = sharpness_sum / max(1, coverage_count)
+
     return {
         "RMSE": rmse,
         "MAE": float(mae),
@@ -964,6 +993,8 @@ def rolling_forward_backtest(
         "NLL_mean": float(nll_mean),
         "CRPS_mean": crps_mean,
         "CRPS_per_h": crps_per_h,
+        "Coverage_80%": coverage_final,
+        "Sharpness_80%": sharpness_final,
         "settings": {
             "num_samples": int(num_samples),
             "z_shrink": float(z_shrink),
