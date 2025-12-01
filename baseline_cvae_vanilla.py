@@ -182,6 +182,22 @@ def train_model_vanilla(
     torch.save(model.state_dict(), save_path)
     return model
 
+
+###############################################
+# CVaR helper
+###############################################
+def compute_cvar(return_samples, alpha=0.10):
+    """
+    CVaR(alpha): return <= VaR(alpha)의 평균
+    return_samples: (M,) numpy array
+    """
+    var_alpha = np.quantile(return_samples, alpha)
+    tail = return_samples[return_samples <= var_alpha]
+    if tail.size == 0:
+        return float(var_alpha)
+    return float(tail.mean())
+
+
 ###############################################
 # Rolling-Forward Evaluation (weak cVAE)
 ###############################################
@@ -190,7 +206,10 @@ def rolling_forward_cvae(
     X, Y, C,
     latent_dim, cond_dim, hidden,
     H, L, beta,
-    device="cuda"
+    device="cuda",
+    num_samples=500,
+    feature_index=0,
+    alpha_cvar=0.10,
 ):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     N, L_, D = X.shape
@@ -207,13 +226,15 @@ def rolling_forward_cvae(
     nlls, crps_list = [], []
     coverage_list, sharpness_list = [], []
 
+    cvar_10 = None  # 마지막 anchor에서만 계산
+
     for i in range(N):
         x = torch.tensor(X[i:i+1], dtype=torch.float32, device=device)
         y = torch.tensor(Y[i:i+1], dtype=torch.float32, device=device)
         c = torch.tensor(C[i:i+1], dtype=torch.float32, device=device)
 
         with torch.no_grad():
-            mu_dec, var_dec, _, _, _, _ = model(x, c)
+            mu_dec, var_dec, mu_q, logvar_q, _, _ = model(x, c)
 
         p = mu_dec.cpu().numpy()[0]        # (H, D)
         v = var_dec.cpu().numpy()[0]
@@ -230,7 +251,7 @@ def rolling_forward_cvae(
         # ---------- CRPS ----------
         z = (t - p) / sigma
         crps = sigma * (
-            z * (2 * norm.cdf(z) - 1) + 
+            z * (2 * norm.cdf(z) - 1) +
             2 * norm.pdf(z) - 1 / np.sqrt(np.pi)
         )
         crps_list.append(np.mean(crps))
@@ -247,6 +268,21 @@ def rolling_forward_cvae(
 
         sharpness_list.append(float((upper - lower).mean()))
 
+        # ---------- CVaR_10% (마지막 anchor에서만) ----------
+        if i == N - 1:
+            M = int(num_samples)
+            # Gaussian 시나리오 샘플링: (M,H,D)
+            eps = np.random.randn(M, H, D)
+            y_samples = p[None, :, :] + eps * sigma[None, :, :]
+
+            # 마지막 horizon, 선택 feature
+            y_last = y_samples[:, -1, feature_index]   # (M,)
+
+            current = X[i, -1, feature_index]          # scaled current level
+            returns = (y_last / current) - 1.0         # (M,)
+
+            cvar_10 = compute_cvar(returns, alpha=alpha_cvar)
+
     preds = np.array(preds)
     trues = np.array(trues)
 
@@ -260,5 +296,5 @@ def rolling_forward_cvae(
         "CRPS_mean": float(np.mean(crps_list)),
         "Coverage_80%": float(np.mean(coverage_list)),
         "Sharpness_80%": float(np.mean(sharpness_list)),
+        "CVaR_10%": cvar_10,
     }
-
