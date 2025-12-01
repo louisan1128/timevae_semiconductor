@@ -1,4 +1,4 @@
-# baseline_cvae_vanilla.py
+# baseline_cvae_vanilla_weak.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +8,7 @@ from scipy.stats import norm
 
 
 ###############################################
-# Dataset (same as TimeSeriesDataset)
+# Dataset
 ###############################################
 class TimeSeriesDataset(Dataset):
     def __init__(self, x, y, c):
@@ -22,31 +22,39 @@ class TimeSeriesDataset(Dataset):
 
 
 ###############################################
-#  Encoder (no macro)
+# Encoder (weak version)
 ###############################################
 class Encoder(nn.Module):
     def __init__(self, x_dim, cond_dim, hidden, latent_dim, L):
         super().__init__()
         self.L = L
         self.x_dim = x_dim
+
         self.fc1 = nn.Linear(L * x_dim + cond_dim, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
+
         self.mu = nn.Linear(hidden, latent_dim)
         self.logvar = nn.Linear(hidden, latent_dim)
 
     def forward(self, x, c):
         B, L, D = x.shape
         x_flat = x.reshape(B, L * D)
+
+        # --- condition dropout (약화 요소 1) ---
+        c = F.dropout(c, p=0.2, training=self.training)
+
         inp = torch.cat([x_flat, c], dim=1)
+
         h = F.relu(self.fc1(inp))
         h = F.relu(self.fc2(h))
+
         mu = self.mu(h)
         logvar = self.logvar(h)
         return mu, logvar
 
 
 ###############################################
-#  Conditional Prior (no macro)
+# Conditional Prior (unchanged)
 ###############################################
 class ConditionalPrior(nn.Module):
     def __init__(self, cond_dim, hidden, latent_dim):
@@ -63,7 +71,7 @@ class ConditionalPrior(nn.Module):
 
 
 ###############################################
-#  Decoder (Gaussian)
+# Decoder (weak variance)
 ###############################################
 class Decoder(nn.Module):
     def __init__(self, latent_dim, cond_dim, hidden, H, D):
@@ -72,6 +80,7 @@ class Decoder(nn.Module):
         self.fc2 = nn.Linear(hidden, hidden)
         self.mu = nn.Linear(hidden, H * D)
         self.logvar = nn.Linear(hidden, H * D)
+
         self.H = H
         self.D = D
 
@@ -82,13 +91,15 @@ class Decoder(nn.Module):
 
         mu = self.mu(h).reshape(-1, self.H, self.D)
         logvar = self.logvar(h).reshape(-1, self.H, self.D)
-        var = torch.exp(logvar) + 1e-6
+
+        # --- variance noise (약화 요소 2) ---
+        var = torch.exp(logvar) + 1e-3
 
         return mu, var
 
 
 ###############################################
-#  Full Vanilla cVAE
+# Full Vanilla cVAE
 ###############################################
 class CVAE(nn.Module):
     def __init__(self, x_dim, cond_dim, latent_dim, hidden, H, D, L):
@@ -110,14 +121,14 @@ class CVAE(nn.Module):
 
 
 ###############################################
-#  Train Vanilla cVAE
+# Train Vanilla cVAE (weak)
 ###############################################
 def train_model_vanilla(
     X, Y, C,
     latent_dim, cond_dim, hidden,
     H_len, L, lr, epochs, batch_size, beta,
     device="cuda",
-    save_path="cvae_vanilla.pth"
+    save_path="cvae_vanilla_weak.pth"
 ):
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     N, L_, D = X.shape
@@ -137,6 +148,7 @@ def train_model_vanilla(
     ds = TimeSeriesDataset(X, Y, C)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
+    # KL divergence
     def kl(mu_q, logvar_q, mu_p, logvar_p):
         return 0.5 * torch.mean(
             logvar_p - logvar_q +
@@ -154,93 +166,18 @@ def train_model_vanilla(
             opt.zero_grad()
             mu_dec, var_dec, mu_q, logvar_q, mu_p, logvar_p = model(x, c)
 
-            # Gaussian NLL
             recon = 0.5 * (torch.log(var_dec) + (y - mu_dec)**2 / var_dec)
             recon = recon.mean()
-
             kl_loss = kl(mu_q, logvar_q, mu_p, logvar_p)
-            loss = recon + beta * kl_loss
 
+            loss = recon + beta * kl_loss
             loss.backward()
             opt.step()
+
             total += loss.item()
 
         if ep % 10 == 0:
-            print(f"[vanilla cVAE {ep:03d}] loss={total/len(dl):.4f}")
+            print(f"[weak cVAE {ep:03d}] loss={total/len(dl):.4f}")
 
     torch.save(model.state_dict(), save_path)
     return model
-def rolling_forward_cvae(
-    model_path,
-    X, Y, C,
-    latent_dim, cond_dim, hidden,
-    H, L, beta,
-    device="cuda"
-):
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    N, L_, D = X.shape
-
-    model = CVAE(
-        x_dim=D, cond_dim=cond_dim, latent_dim=latent_dim, hidden=hidden,
-        H=H, D=D, L=L
-    ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-
-    preds, trues = [], []
-    nlls = []
-    crps_list = []
-    coverage_list = []
-    sharpness_list = []
-
-    for i in range(N):
-        x = torch.tensor(X[i:i+1], dtype=torch.float32, device=device)
-        y = torch.tensor(Y[i:i+1], dtype=torch.float32, device=device)
-        c = torch.tensor(C[i:i+1], dtype=torch.float32, device=device)
-
-        with torch.no_grad():
-            mu_dec, var_dec, _, _, _, _ = model(x, c)
-
-        p = mu_dec.cpu().numpy()[0]        # (H, D)
-        v = var_dec.cpu().numpy()[0]
-        sigma = np.sqrt(v)
-        t = y.cpu().numpy()[0]
-
-        preds.append(p)
-        trues.append(t)
-
-        # ---------- NLL ----------
-        nll = 0.5 * (np.log(2 * np.pi * sigma**2) + (t - p)**2 / (sigma**2))
-        nlls.append(float(np.mean(nll)))
-
-        # ---------- CRPS ----------
-        z = (t - p) / sigma
-        crps = sigma * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi))
-        crps_list.append(np.mean(crps))
-
-        # ---------- Coverage / Sharpness ----------
-        z_low = norm.ppf(0.10)   # 10%
-        z_up  = norm.ppf(0.90)   # 90%
-
-        lower = p + sigma * z_low
-        upper = p + sigma * z_up
-
-        inside = (t >= lower) & (t <= upper)
-        coverage_list.append(float(inside.mean()))
-
-        sharpness_list.append(float((upper - lower).mean()))
-
-    preds = np.array(preds)
-    trues = np.array(trues)
-
-    rmse = float(np.sqrt(np.mean((preds - trues)**2)))
-
-    return {
-        "preds": preds,
-        "trues": trues,
-        "RMSE": rmse,
-        "NLL_mean": float(np.mean(nlls)),
-        "CRPS_mean": float(np.mean(crps_list)),
-        "Coverage_80%": float(np.mean(coverage_list)),
-        "Sharpness_80%": float(np.mean(sharpness_list)),
-    }
