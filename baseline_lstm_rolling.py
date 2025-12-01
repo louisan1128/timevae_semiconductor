@@ -67,7 +67,7 @@ def rolling_forward_lstm(
 
     for i in range(N):
         x = torch.tensor(X[i:i+1, :, target_index:target_index+1], dtype=torch.float32, device=device)  # (1,L,1)
-        pred = model(x).cpu().numpy()    # (1,H,1)
+        pred = model(x).detach().cpu().numpy()
         preds.append(pred[0,:,0])
         trues.append(Y[i,:,target_index])
 
@@ -102,3 +102,4 @@ def rolling_forward_lstm(
         "CRPS_mean": crps_mean,
         "CRPS_per_h": crps_per_h,
     }
+
