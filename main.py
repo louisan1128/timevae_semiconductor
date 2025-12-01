@@ -41,7 +41,7 @@ H = 12
 
 LATENT_DIM = 32
 
-COND_DIM = 5
+COND_DIM = 4
 HIDDEN = 128
 
 POLY_ORDER = 2
@@ -61,7 +61,6 @@ MACRO_LATENT_DIM = 32   # macro encoder latent dim
 # -------------------------------
 condition_raw_cols = [
     "Exchange Rate",
-    "CAPEX",
     "PMI",
     "CLI",
     "ISM",
@@ -198,7 +197,6 @@ if __name__ == "__main__":
     # 시나리오 조건 (RAW 형태)
     scenario_cond_raw = {
         "Exchange Rate": 1388.91,
-        "CAPEX": 93163.0,
         "PMI": 48.0,
         "CLI": 100.27,
         "ISM": 51.4,
