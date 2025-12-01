@@ -27,13 +27,9 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx], self.c[idx]
-# -------------------------------
-# Create Dataset (Sliding Window)
-# -------------------------------
 def create_dataset(df_scaled, L, H, cond_cols):
     X, Y, C = [], [], []
     total_len = len(df_scaled)
-    
 
     for start in range(total_len - L - H):
         end_x = start + L
@@ -43,7 +39,6 @@ def create_dataset(df_scaled, L, H, cond_cols):
         y = df_scaled.iloc[end_x:end_y].values
         c = df_scaled.iloc[end_x - 1][cond_cols].values
 
-
         X.append(x)
         Y.append(y)
         C.append(c)
@@ -51,13 +46,8 @@ def create_dataset(df_scaled, L, H, cond_cols):
     return (
         np.array(X, dtype=np.float32),
         np.array(Y, dtype=np.float32),
-        np.array(C, dtype=np.float32),
+        np.array(C, dtype=np.float32)
     )
-
-
-
-
-
 # -------------------------------
 # Preprocess (Load CSV → Scaling)
 # -------------------------------
