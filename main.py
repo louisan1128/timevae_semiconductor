@@ -433,6 +433,31 @@ if __name__ == "__main__":
     print(f"ARIMA NLL  : {arima_res['NLL']:.4f}")
     print(f"ARIMA CRPS : {arima_res['CRPS']:.4f}")
     print("====================================")
+
+    # =======================================
+    # LSTM Baseline
+    # =======================================
+    from baseline_lstm import train_lstm_baseline
     
+    print("========== LSTM Baseline ==========")
+    
+    lstm_res = train_lstm_baseline(
+        X=X,
+        Y=Y,
+        target_index=0,    # Export
+        H=H,
+        hidden_dim=64,
+        num_layers=2,
+        epochs=50,
+        batch_size=32,
+        lr=1e-3,
+        device=DEVICE
+    )
+    
+    print(f"LSTM MSE  : {lstm_res['MSE']:.4f}")
+    print(f"LSTM MAE  : {lstm_res['MAE']:.4f}")
+    print(f"LSTM RMSE : {lstm_res['RMSE']:.4f}")
+    print("====================================")
+
     
 
