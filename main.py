@@ -434,6 +434,9 @@ if __name__ == "__main__":
     print(f"ARIMA RMSE : {arima_res['RMSE']:.4f}")
     print(f"ARIMA NLL  : {arima_res['NLL']:.4f}")
     print(f"ARIMA CRPS : {arima_res['CRPS']:.4f}")
+    print(f"ARIMA Coverage_80% : {arima_res['Coverage_80%']:.4f}")
+    print(f"ARIMA Sharpness_80% : {arima_res['Sharpness_80%']:.4f}")
+
     print("====================================")
 
     # =======================================
