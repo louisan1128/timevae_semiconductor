@@ -6,7 +6,10 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.stats import gaussian_kde
 import math
+import pandas as pd
 
 from model import Encoder, Decoder, ConditionalPrior, TimeVAE
 from macro_pretrain import MacroEncoder
@@ -243,148 +246,6 @@ def plot_fanchart_long(true_seq_full,
 
 
 
-
-
-def rolling_posterior_forecast(
-    model_path, X, C,
-    latent_dim, cond_dim, hidden, H, beta,
-    macro_feature_indices,
-    macro_hidden_dim, macro_latent_dim,
-    device="cuda"
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dim = X.shape[-1]
-
-    macro_input_dim = len(macro_feature_indices)
-    macro_encoder = MacroEncoder(
-        input_dim=macro_input_dim,
-        hidden_dim=macro_hidden_dim,
-        latent_dim=macro_latent_dim
-    ).to(device)
-    macro_encoder.load_state_dict(torch.load("macro_encoder.pth", map_location=device))
-    macro_encoder.eval()
-
-    encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
-    decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior   = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
-
-    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-
-    preds = []
-
-    with torch.no_grad():
-        for t in range(len(X)):
-            x = torch.tensor(X[t:t+1]).float().to(device)
-            c = torch.tensor(C[t:t+1]).float().to(device)
-
-            macro_x = x[:, :, macro_feature_indices].permute(0,2,1)
-
-            # posterior mean
-            mu_q, logvar_q = model.encoder(x, c)
-            mean, _ = model.decoder(mu_q, c)
-
-            preds.append(mean[0,0,:].cpu().numpy())
-
-    return np.array(preds)
-
-
-
-
-def posterior_scenario(
-    model_path, X_last, C_last,
-    latent_dim, cond_dim, hidden, H, beta,
-    macro_feature_indices,
-    macro_hidden_dim, macro_latent_dim,
-    num_samples=30, shrink=0.2,
-    device="cuda"
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dim = X_last.shape[-1]
-
-    macro_input_dim = len(macro_feature_indices)
-    macro_encoder = MacroEncoder(
-        input_dim=macro_input_dim,
-        hidden_dim=macro_hidden_dim,
-        latent_dim=macro_latent_dim
-    ).to(device)
-    macro_encoder.load_state_dict(torch.load("macro_encoder.pth", map_location=device))
-    macro_encoder.eval()
-    for p in macro_encoder.parameters():
-        p.requires_grad = False
-
-    encoder = Encoder(out_dim, cond_dim, hidden, latent_dim).to(device)
-    decoder = Decoder(latent_dim, cond_dim, out_dim, hidden, H).to(device)
-    prior   = ConditionalPrior(cond_dim, macro_latent_dim, latent_dim, hidden).to(device)
-
-    model = TimeVAE(encoder, decoder, prior, macro_encoder, latent_dim, beta).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-
-    X_t = torch.tensor(X_last[None]).float().to(device)
-    C_t = torch.tensor(C_last[None]).float().to(device)
-    macro_x = X_t[:, :, macro_feature_indices].permute(0,2,1)
-
-    with torch.no_grad():
-        mu_q, logvar_q = model.encoder(X_t, C_t)
-        std_q = torch.exp(0.5 * logvar_q)
-
-    samples = []
-
-    with torch.no_grad():
-        for _ in range(num_samples):
-            eps = torch.randn_like(std_q)
-            z = mu_q + shrink * std_q * eps
-
-            mean, _ = model.decoder(z, C_t)
-            samples.append(mean.squeeze(0).cpu().numpy())
-
-    return np.stack(samples, axis=0)
-
-
-
-
-
-
-
-def plot_full_forecast_and_scenario(
-    true_full,
-    forecast_full,
-    scenario_samples,
-    feature_index=0,
-    H=12
-):
-    true_full = np.array(true_full)
-    forecast_full = np.array(forecast_full)
-    scenario_samples = np.array(scenario_samples)
-
-    N = len(true_full)
-    t = np.arange(N)
-
-    # Scenario percentiles
-    lower = np.percentile(scenario_samples[:, :, feature_index], 10, axis=0).squeeze()
-    median = np.percentile(scenario_samples[:, :, feature_index], 50, axis=0).squeeze()
-    upper = np.percentile(scenario_samples[:, :, feature_index], 90, axis=0).squeeze()
-
-    t_future = np.arange(N, N + H)
-
-    plt.figure(figsize=(14, 6))
-
-    # 1) True 전체
-    plt.plot(t, true_full[:, feature_index], color="black", label="History (True)")
-
-    # 2) Rolling forecast
-    plt.plot(t, forecast_full[:, feature_index], color="blue", label="Prediction")
-
-    # 3) Scenario fan chart
-    plt.plot(t_future, median, color="red", label="Median Scenario")
-    plt.fill_between(t_future, lower, upper, color="red", alpha=0.25)
-
-    plt.title("Full Horizon: True vs Prediction vs Scenario")
-    plt.grid(True)
-    plt.legend()
-    plt.show()
 
 
 
@@ -728,61 +589,218 @@ def compare_models_probabilistic_nll(
 
     return results
 
-
-
-
-def run_ablation(
-    X, Y, C,
-    latent_dim, cond_dim, hidden, H, beta,
-    macro_feature_indices,
-    macro_hidden_dim,
-    macro_latent_dim,
-    device="cuda"
+def plot_baseline_fanchart_recent(
+    true_seq_full,          # df_scaled.values 전체 (scaled history)
+    pred_seq_last,          # preds[-1] (마지막 chunk의 H-step 예측 median)
+    scenario_samples,       # scenario_samples (M, H, D)
+    df_index,               # df_scaled.index (DatetimeIndex)
+    feature_index=0,
+    history=60              # 최근 5년(=60 months)
 ):
-    print("\n\n======================")
-    print("ABALTION: Point Forecast")
-    print("======================\n")
+    """
+    Baseline Fan Chart (최근 5년 + 예측 12개월)
+    - 과거 데이터와 예측 데이터가 '연속된 시계열'로 자연스럽게 이어짐
+    """
 
-    point_results = compare_models_point_forecast(
-        model_paths=ablation_model_paths,
-        X=X, Y=Y, C=C,
-        latent_dim=latent_dim,
-        cond_dim=cond_dim,
-        hidden=hidden,
-        H=H, beta=beta,
-        macro_feature_indices=macro_feature_indices,
-        macro_hidden_dim=macro_hidden_dim,
-        macro_latent_dim=macro_latent_dim,
-        device=device
+    # -----------------------------
+    # 1) 최근 히스토리 추출
+    # -----------------------------
+    past_values = true_seq_full[-history:, feature_index]
+    past_dates = df_index[-history:]
+
+    # -----------------------------
+    # 2) 예측 구간 날짜 만들기
+    # -----------------------------
+    last_date = df_index[-1]
+    future_dates = pd.date_range(
+        start=last_date + pd.DateOffset(months=1),
+        periods=len(pred_seq_last),
+        freq='MS'
     )
 
-    for name, metrics in point_results.items():
-        print(f"\n=== {name} ===")
-        print(f"MSE : {metrics['MSE']:.4f}")
-        print(f"MAE : {metrics['MAE']:.4f}")
-        print(f"RMSE: {metrics['RMSE']:.4f}")
+    # -----------------------------
+    # 3) Fan Chart 구간 계산
+    # -----------------------------
+    samples = scenario_samples[:, :, feature_index]     # (num_samples, H)
+
+    p10 = np.percentile(samples, 10, axis=0)
+    p90 = np.percentile(samples, 90, axis=0)
+    p25 = np.percentile(samples, 25, axis=0)
+    p75 = np.percentile(samples, 75, axis=0)
+    median_pred = np.median(samples, axis=0)
+
+    median_pred = median_pred - median_pred[0] + past_values[-1]
+    p10 = p10 - p10[0] + past_values[-1]
+    p25 = p25 - p25[0] + past_values[-1]
+    p75 = p75 - p75[0] + past_values[-1]
+    p90 = p90 - p90[0] + past_values[-1]
+    # -----------------------------
+    # 4) 그래프 그리기
+    # -----------------------------
+    plt.figure(figsize=(14, 6))
+
+    # 과거 구간
+    plt.plot(past_dates, past_values, label="History (True)", color="blue")
+
+    # 예측 구간: P10–P90
+    plt.fill_between(future_dates, p10, p90, color="skyblue", alpha=0.3, label="P10–P90")
+
+    # 예측 구간: P25–P75
+    plt.fill_between(future_dates, p25, p75, color="orange", alpha=0.5, label="P25–P75")
+
+    # 예측 median
+    plt.plot(future_dates, median_pred, "--", color="darkorange", linewidth=2, label="Scenario median")
+
+    # 마지막 히스토리 포인트 강조
+    plt.scatter([past_dates[-1]], [past_values[-1]], color="red", s=60, zorder=5)
+
+    # -----------------------------
+    # 5) X축 날짜 포맷
+    # -----------------------------
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    plt.xticks(rotation=45)
+
+    plt.title("Baseline Fan Chart (Recent 5 Years + Next 12 Months)", fontsize=14)
+    plt.ylabel("Scaled value")
+    plt.grid(alpha=0.2)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
-    print("\n\n======================")
-    print("ABALTION: Probabilistic NLL")
-    print("======================\n")
 
-    prob_results = compare_models_probabilistic_nll(
-        model_paths=ablation_model_paths,
-        X=X, Y=Y, C=C,
-        latent_dim=latent_dim,
-        cond_dim=cond_dim,
-        hidden=hidden,
-        H=H, beta=beta,
-        macro_feature_indices=macro_feature_indices,
-        macro_hidden_dim=macro_hidden_dim,
-        macro_latent_dim=macro_latent_dim,
-        device=device
+def plot_forecast_zoom(
+    pred_seq_last,         # preds[-1] / Rolling_forecast 라도 가능
+    scenario_samples,      # scenario_samples (M, H, D)
+    df_index,              # df_scaled.index
+    feature_index=0,
+):
+    """
+    예측 12개월만 확대해서 (fan chart + median) 시각화
+    """
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    import matplotlib.dates as mdates
+
+    H = pred_seq_last.shape[0]
+
+    # 날짜 생성
+    last_date = df_index[-1]
+    future_dates = pd.date_range(
+        start=last_date + pd.DateOffset(months=1),
+        periods=H,
+        freq='MS'
     )
 
-    for name, metrics in prob_results.items():
-        print(f"\n=== {name} ===")
-        print(f"NLL_mean = {metrics['NLL_mean']:.4f}")
-        print(f"NLL_std  = {metrics['NLL_std']:.4f}")
+    # Fan chart data
+    samples = scenario_samples[:, :, feature_index]
+    p10 = np.percentile(samples, 10, axis=0)
+    p90 = np.percentile(samples, 90, axis=0)
+    p25 = np.percentile(samples, 25, axis=0)
+    p75 = np.percentile(samples, 75, axis=0)
+    median_pred = np.median(samples, axis=0)
 
-    return point_results, prob_results
+    # Plot
+    plt.figure(figsize=(8, 5))
+
+    # Fan chart
+    plt.fill_between(future_dates, p10, p90, color="skyblue", alpha=0.3, label="P10–P90")
+    plt.fill_between(future_dates, p25, p75, color="orange", alpha=0.5, label="P25–P75")
+    plt.plot(future_dates, median_pred, "--", color="darkorange", linewidth=2, label="Scenario Median")
+
+    # Format
+    plt.title("Zoom-in: Next 12 Months Forecast", fontsize=13)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.xticks(rotation=45)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+
+def plot_kde_with_stats(scenario_samples_dict, feature_index=0, horizon_idx=-1):
+    """
+    KDE Density Curve + Scenario Mean/Std Table (자동 생성)
+    """
+
+    plt.figure(figsize=(12, 6))
+
+    stats = []   # mean / std 저장
+
+    for name, samples in scenario_samples_dict.items():
+        vals = samples[:, horizon_idx, feature_index]
+
+        # KDE
+        kde = gaussian_kde(vals)
+        x_grid = np.linspace(vals.min() - 0.5, vals.max() + 0.5, 300)
+        plt.plot(x_grid, kde(x_grid), linewidth=2, label=name)
+
+        # 통계 저장
+        stats.append({
+            "Scenario": name,
+            "Mean (μ)": np.mean(vals),
+            "Std (σ)": np.std(vals),
+            "5%": np.percentile(vals, 5),
+            "95%": np.percentile(vals, 95)
+        })
+
+    # 그래프 스타일
+    plt.title("Scenario Comparison — Density Curve (KDE)")
+    plt.xlabel("Predicted Export Level (Scaled or Raw)")
+    plt.ylabel("Density")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # ====== 테이블 출력 ======
+    df_stats = pd.DataFrame(stats)
+    print("\n=== Scenario Mean / Std / Quantile Table ===")
+    print(df_stats.to_string(index=False))
+
+    return df_stats
+
+
+
+def plot_df_scale_shift(df_dict, scale_dict):
+    """
+    시나리오별 df / scale 변화 비교
+    df_dict: {"Baseline": df_arr, "ExRate": df_arr, ...}
+    scale_dict: 동일 구조
+    """
+
+    horizons = np.arange(1, len(list(df_dict.values())[0]) + 1)
+
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ---- df plot ----
+    for name, df_arr in df_dict.items():
+        axs[0].plot(horizons, df_arr, label=name)
+    axs[0].set_title("df (Degrees of Freedom) Comparison")
+    axs[0].set_xlabel("Horizon")
+    axs[0].set_ylabel("df")
+    axs[0].grid(alpha=0.3)
+    axs[0].legend()
+
+    # ---- scale plot ----
+    for name, sc_arr in scale_dict.items():
+        axs[1].plot(horizons, sc_arr, label=name)
+    axs[1].set_title("Scale (Uncertainty Level) Comparison")
+    axs[1].set_xlabel("Horizon")
+    axs[1].set_ylabel("Scale")
+    axs[1].grid(alpha=0.3)
+    axs[1].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+

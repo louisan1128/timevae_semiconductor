@@ -4,6 +4,7 @@
 import torch
 import numpy as np
 import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
 
 from data_train import (
     preprocess,
@@ -15,17 +16,16 @@ from data_train import (
 from scenario_eval import (
     evaluate_model,
     scenario_predict_local,
-    plot_fanchart,
-    plot_fanchart_long,
-    rolling_posterior_forecast,
-    plot_full_forecast_and_scenario,
-    posterior_scenario,
+
+    plot_forecast_zoom,
+    plot_baseline_fanchart_recent,
+    plot_kde_with_stats,
 
     compute_point_forecast_metrics,
     compute_coverage_and_sharpness,
     compute_crps_from_samples,
     evaluate_student_t_nll,
-    compute_risk_metrics,
+    compute_risk_metrics
 )
 
 # -------------------------------
@@ -35,7 +35,7 @@ L = 36
 H = 12
 
 LATENT_DIM = 32
-COND_DIM = 5
+COND_DIM = 6
 HIDDEN = 128
 
 BETA = 1.0
@@ -57,6 +57,7 @@ condition_raw_cols = [
     "PMI",
     "CLI",
     "ISM",
+    "GS10" 
 ]
 
 MACRO_COLS = [
@@ -197,9 +198,11 @@ if __name__ == "__main__":
         "PMI": 48.0,
         "CLI": 100.27,
         "ISM": 51.4,
+        "GS10": 4.26
     }
 
-    # ✅ FIXED: safe raw->scaled condition vector (feature-name warning / object dtype / CAPEX log1p 일치)
+    
+
     scenario_cond_scaled = make_scaled_condition_vector(
         last_truth_raw=last_truth_raw,
         scenario_cond_raw=scenario_cond_raw,
@@ -227,75 +230,153 @@ if __name__ == "__main__":
         device=DEVICE
     )
 
+    ##시나리오 1
+    scenario_cond_raw = {
+        "Exchange Rate": 1527.8,
+        "CAPEX": 93163.0,
+        "PMI": 48.0,
+        "CLI": 100.27,
+        "ISM": 51.4,
+        "GS10": 4.26
+    }
+
+    scenario_cond_scaled = make_scaled_condition_vector(
+        last_truth_raw=last_truth_raw,
+        scenario_cond_raw=scenario_cond_raw,
+        df_scaled=df_scaled,
+        scaler=scaler,
+        condition_raw_cols=condition_raw_cols,
+    )
+
+    scenario_samples_1 = scenario_predict_local(
+        model_path="timevae_ctvae_prior.pth",
+        X_last=X[-1],
+        cond_true=C[-1],
+        cond_scenario=scenario_cond_scaled,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        beta=BETA,
+        num_samples=50,
+        z_shrink=0.5,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
+        device=DEVICE
+    )
+
+    ##시나리오 2
+    scenario_cond_raw = {
+        "Exchange Rate": 1388.91,
+        "CAPEX": 93163.0,
+        "PMI": 48.0,
+        "CLI": 100.27,
+        "ISM": 51.4,
+        "GS10": 3.6
+    }
+
+    scenario_cond_scaled = make_scaled_condition_vector(
+        last_truth_raw=last_truth_raw,
+        scenario_cond_raw=scenario_cond_raw,
+        df_scaled=df_scaled,
+        scaler=scaler,
+        condition_raw_cols=condition_raw_cols,
+    )
+
+    scenario_samples_2 = scenario_predict_local(
+        model_path="timevae_ctvae_prior.pth",
+        X_last=X[-1],
+        cond_true=C[-1],
+        cond_scenario=scenario_cond_scaled,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        beta=BETA,
+        num_samples=50,
+        z_shrink=0.5,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
+        device=DEVICE
+    )
+
+    ##시나리오 3
+    scenario_cond_raw = {
+        "Exchange Rate": 1300.0,
+        "PMI": 55.0,
+        "CLI": 102.0,
+        "ISM": 55.0,
+        "GS10": 3.6
+    }
+
+    scenario_cond_scaled = make_scaled_condition_vector(
+        last_truth_raw=last_truth_raw,
+        scenario_cond_raw=scenario_cond_raw,
+        df_scaled=df_scaled,
+        scaler=scaler,
+        condition_raw_cols=condition_raw_cols,
+    )
+
+    scenario_samples_3 = scenario_predict_local(
+        model_path="timevae_ctvae_prior.pth",
+        X_last=X[-1],
+        cond_true=C[-1],
+        cond_scenario=scenario_cond_scaled,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        hidden=HIDDEN,
+        H=H,
+        beta=BETA,
+        num_samples=50,
+        z_shrink=0.5,
+        macro_feature_indices=macro_feature_indices,
+        macro_hidden_dim=MACRO_HIDDEN_DIM,
+        macro_latent_dim=MACRO_LATENT_DIM,
+        device=DEVICE
+    )
+
+
+
     # =======================================
     # 7) Fan Chart 출력
     # =======================================
     print("========== 7) Plotting Fan Chart ==========")
 
-    plot_fanchart(
-        true_seq=trues[-1],
-        pred_seq=preds[-1],
-        scenario_samples=scenario_samples,
-        feature_index=0
-    )
-
-    plot_fanchart_long(
+    plot_baseline_fanchart_recent(
         true_seq_full=df_scaled.values,
         pred_seq_last=preds[-1],
         scenario_samples=scenario_samples,
+        df_index=df_scaled.index,
         feature_index=0,
         history=60
     )
 
+    plot_forecast_zoom(
+        pred_seq_last=preds[-1],              # 마지막 chunk 12개월 예측
+        scenario_samples=scenario_samples,    # baseline scenario or custom scenario
+        df_index=df_scaled.index,             # 날짜 index
+        feature_index=0                       # 첫 번째 feature (exports)
+    )
+
+
+
+    scenario_samples_dict = {
+        "Baseline": scenario_samples,
+        "ExRate +10%": scenario_samples_1,
+        "GS10 -15%": scenario_samples_2,
+        "Recovery": scenario_samples_3
+    }
+
+    plot_kde_with_stats(scenario_samples_dict)
+
+
+
+
+
+
     print("=========== Completed 1st! ===========")
-
-    # 1) Rolling forecast (파란선)
-    forecast_full = rolling_posterior_forecast(
-        "timevae_ctvae_prior.pth",
-        X,
-        C,
-        latent_dim=LATENT_DIM,
-        cond_dim=COND_DIM,
-        hidden=HIDDEN,
-        H=H,
-        beta=BETA,
-        macro_feature_indices=macro_feature_indices,
-        macro_hidden_dim=MACRO_HIDDEN_DIM,
-        macro_latent_dim=MACRO_LATENT_DIM,
-        device=DEVICE
-    )
-
-    # 2) 마지막 시점 posterior-scenario (빨간선)
-    samples_posterior = posterior_scenario(
-        model_path="timevae_ctvae_prior.pth",
-        X_last=X[-1],
-        C_last=C[-1],
-        latent_dim=LATENT_DIM,
-        cond_dim=COND_DIM,
-        hidden=HIDDEN,
-        H=H,
-        beta=BETA,
-        macro_feature_indices=macro_feature_indices,
-        macro_hidden_dim=MACRO_HIDDEN_DIM,
-        macro_latent_dim=MACRO_LATENT_DIM,
-        num_samples=30,
-        shrink=0.1,
-        device=DEVICE
-    )
-
-    # 3) true 전체 시계열 (각 chunk의 첫 y가 true future 1-step)
-    true_full = Y[:, 0, :]
-
-    # 4) Plot (scenario는 “scenario_predict_local” 결과로)
-    plot_full_forecast_and_scenario(
-        true_full=true_full,                 # (N, D)
-        forecast_full=forecast_full,         # (N, D)
-        scenario_samples=scenario_samples,   # (M, H, D)
-        feature_index=0,
-        H=H
-    )
-
-    print("=========== Completed 2nd! ===========")
 
     # =======================================
     # Metrics
@@ -363,6 +444,8 @@ if __name__ == "__main__":
     print("=== Risk Metrics ===")
     for k, v in risk.items():
         print(f"{k}: {v}")
+
+     
         
 def debug_last_step_distribution(model, X, C, macro_feature_indices, Y=None, tag=""):
     device = next(model.parameters()).device
@@ -400,3 +483,105 @@ def debug_last_step_distribution(model, X, C, macro_feature_indices, Y=None, tag
             print(f"[{tag}] NLL using z=mu_q: {nll_q:.4f} | using z=mu_p: {nll_p:.4f}")
 
 debug_last_step_distribution(model, X, C, macro_feature_indices, Y=Y, tag="LAST")
+
+
+
+# =======================================
+# ARIMA Baseline
+# =======================================
+print("========== ARIMA Baseline ==========")
+
+from baseline_arima import arima_baseline
+
+arima_res = arima_baseline(
+    X=X,
+    Y=Y,
+    target_index=0,
+    L=L,
+    H=H
+)
+
+print(f"ARIMA RMSE : {arima_res['RMSE']:.4f}")
+print(f"ARIMA NLL  : {arima_res['NLL']:.4f}")
+print(f"ARIMA CRPS : {arima_res['CRPS']:.4f}")
+print(f"ARIMA Coverage_80% : {arima_res['Coverage_80%']:.4f}")
+print(f"ARIMA Sharpness_80% : {arima_res['Sharpness_80%']:.4f}")
+
+print("====================================")
+
+# =======================================
+# LSTM Baseline
+# ======================================
+from baseline_lstm_rolling import train_lstm_once, rolling_forward_lstm
+
+print("========== LSTM Rolling-Forward Baseline ==========")
+
+lstm_model = train_lstm_once(
+    X=X,
+    Y=Y,
+    target_index=0,
+    H=H,
+    hidden=64,
+    layers=2,
+    device=DEVICE,
+    epochs=50
+)
+
+lstm_res = rolling_forward_lstm(
+    lstm_model,
+    X=X,
+    Y=Y,
+    target_index=0,
+    H=H
+)
+
+print(f"LSTM (rolling) RMSE : {lstm_res['RMSE']:.4f}")
+print(f"LSTM (rolling) NLL  : {lstm_res['NLL_mean']:.4f}")
+print(f"LSTM (rolling) CRPS : {lstm_res['CRPS_mean']:.4f}")
+print("CRPS_per_h:", np.round(lstm_res['CRPS_per_h'], 4))
+print(f"LSTM Coverage_80%  : {lstm_res['Coverage_80%']:.4f}")
+print(f"LSTM Sharpness_80% : {lstm_res['Sharpness_80%']:.4f}")
+
+
+        
+from baseline_cvae_vanilla import (
+    train_model_vanilla,
+    rolling_forward_cvae
+)
+
+print("========== Train Vanilla cVAE ==========")
+train_model_vanilla(
+    X, Y, C,
+    latent_dim=LATENT_DIM,
+    cond_dim=COND_DIM,
+    hidden=HIDDEN,
+    H_len=H,
+    L=L,
+    lr=LR,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    beta=BETA,
+    device=DEVICE,
+    save_path="cvae_vanilla.pth"
+)
+
+print("========== Evaluate Vanilla cVAE ==========")
+res_cvae = rolling_forward_cvae(
+    model_path="cvae_vanilla.pth",
+    X=X, Y=Y, C=C,
+    latent_dim=LATENT_DIM,
+    cond_dim=COND_DIM,
+    hidden=HIDDEN,
+    H=H,
+    L=L,
+    beta=BETA,
+    device=DEVICE
+)
+    
+print("========== Vanilla cVAE Baseline ==========")
+print(f"RMSE          : {res_cvae['RMSE']:.4f}")
+print(f"NLL_mean      : {res_cvae['NLL_mean']:.4f}")
+print(f"CRPS_mean     : {res_cvae['CRPS_mean']:.4f}")
+print(f"Coverage_80%  : {res_cvae['Coverage_80%']:.4f}")
+print(f"Sharpness_80% : {res_cvae['Sharpness_80%']:.4f}")
+print("CVaR_10%     :", res_cvae["CVaR_10%"])

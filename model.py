@@ -468,3 +468,5 @@ class TimeVAE(nn.Module):
 
         loss = recon_loss + self.beta * kl_loss
         return loss, recon_loss, kl_loss, mean, z, (mu_p, logvar_p)
+
+
