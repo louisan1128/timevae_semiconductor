@@ -33,6 +33,7 @@ Structured decomposition into trend, seasonality, and residual dynamics, with a 
 
 ## Usage
 python macro_pretrain.py
+
 python main.py
 
 ## Applications
