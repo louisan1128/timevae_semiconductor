@@ -1,106 +1,102 @@
-# 반도체 사이클, 여러 가지 미래로 보기
+# Semiconductor Cycles: Exploring Possible Futures
 
 **Generative Scenario Modeling for Semiconductor Industry Cycles**  
-Conditional Time-VAE를 이용한 반도체 수출 시나리오 분석
+An undergraduate team project using a Conditional Time-VAE to generate semiconductor export scenarios.
 
-반도체 경기는 가격이나 수출뿐 아니라 환율, 금리, 제조업 경기에도 영향을 받습니다. 그렇다면 과거 수출 흐름과 경제 상황을 같이 보고, 앞으로 가능한 경로를 여러 개 만들어 볼 수 있지 않을까 하는 생각에서 시작한 프로젝트입니다.
+Semiconductor cycles are affected by exchange rates, interest rates, and manufacturing activity, as well as past export and price movements. We started this project with a question: could we use this information together to generate several possible paths for the industry?
 
-환율이 오르는 경우, 금리가 내려가는 경우, 경기지표가 함께 좋아지는 경우를 설정하고 예측 경로와 하락 위험이 어떻게 달라지는지 비교했습니다.
+We tried scenarios with a weaker Korean won, lower interest rates, and improving economic indicators, then compared how the forecast distributions and downside risks changed.
 
-[발표 자료 보기](Generative%20Scenario%20Modeling%20for%20Semiconductor%20Industry%20Cycles.pdf) · [실험 노트북](Timevae_final.ipynb)
+[Presentation slides](Generative%20Scenario%20Modeling%20for%20Semiconductor%20Industry%20Cycles.pdf) · [Experiment notebook](Timevae_final.ipynb)
 
-## 어떻게 만들었나
+## How we built it
 
-반도체 데이터는 2010년 1월부터 2025년 8월까지의 월별 자료를 사용했습니다. 수출, DRAM, 환율, CAPEX, PMI, CLI, ISM을 포함하고, **과거 36개월을 보고 다음 12개월을 생성**하도록 구성했습니다.
+We used monthly semiconductor data from January 2010 to August 2025, including exports, DRAM, exchange rates, CAPEX, PMI, CLI, and ISM. The model takes **36 months of observations and generates the following 12 months**.
 
-월별 데이터라 학습에 쓸 수 있는 양이 많지 않았습니다. 이를 보완하기 위해 1970년부터의 FRED 거시경제 데이터로 인코더를 먼저 학습하고, 여기서 얻은 정보를 반도체 모델의 조건부 prior에 연결했습니다.
+There was not much data to train on at this frequency. To make use of a longer history, we first pretrained an encoder on FRED macroeconomic data starting in 1970, then connected its representations to the semiconductor model's conditional prior.
 
-모델은 PyTorch로 구현했습니다. 큰 흐름은 다음과 같습니다.
+The model was implemented in PyTorch. This is the overall architecture used in our presentation:
 
-![CT-VAE 모델 구조](assets/model-architecture.png)
+![CT-VAE model architecture](assets/model-architecture.png)
 
-<sub>발표 자료에 사용한 전체 모델 구조입니다.</sub>
+The temporal encoder uses TCNs with FiLM conditioning. The decoder combines **trend, seasonality, and residual components**, with a Student-t output distribution to represent large fluctuations. In the scenario experiments, we sample around the temporal encoder's latent distribution and change the economic conditions passed to the decoder.
 
-인코더에는 TCN과 FiLM을 사용했고, 디코더는 **추세 + 계절성 + 잔차**를 합쳐 시계열을 만듭니다. 큰 폭의 변동도 표현할 수 있도록 출력분포에는 Student-t를 적용했습니다. 시나리오 실험 코드는 인코더가 만든 잠재분포 주변에서 표본을 뽑고, 디코더에 넣는 경제 조건을 바꾸는 방식입니다.
+## What we found
 
-## 실험해 보니
+This is the forecast under the baseline conditions. The orange dashed line shows the median, and the shaded areas show quantile ranges across the generated paths. The vertical axis uses standardized values. This figure is from the original presentation.
 
-먼저 기본 조건에서 생성한 예측 경로입니다. 주황색 점선은 중앙값이고, 색칠된 영역은 생성 경로의 분위수 구간입니다. 세로축은 표준화된 값이며, 발표 당시의 예측 결과입니다.
+![Semiconductor export forecast under baseline conditions](assets/baseline-forecast.png)
 
-![기본 조건의 반도체 수출 예측 경로](assets/baseline-forecast.png)
+We compared the model with ARIMA, LSTM, and vanilla cVAE. Along with prediction error, we evaluated the forecast distributions using NLL, CRPS, and prediction interval coverage.
 
-ARIMA, LSTM, vanilla cVAE와 비교했습니다. 예측 오차 외에도 예측분포를 평가하는 NLL·CRPS와 예측구간의 포함률을 확인했습니다.
+Here are the main comparison results reported in the presentation. Lower MSE and CRPS are better.
 
-아래는 발표 자료의 비교 결과입니다. MSE와 CRPS는 낮을수록 좋습니다.
-
-| 모델 | MSE ↓ | CRPS ↓ | 80% 예측구간 포함률 |
+| Model | MSE ↓ | CRPS ↓ | 80% interval coverage |
 |---|---:|---:|---:|
 | CT-VAE | 0.4449 | **0.1322** | 86.19% |
-| vanilla cVAE | 0.4476 | 0.1493 | 81.58% |
+| Vanilla cVAE | 0.4476 | 0.1493 | 81.58% |
 | LSTM | **0.3114** | 0.1714 | 82.44% |
 | ARIMA | 0.9491 | 0.7676 | 27.20% |
 
-점예측 오차는 LSTM이 가장 작았고, CT-VAE는 이 비교에서 CRPS가 가장 낮았습니다. 모든 지표에서 더 좋은 모델이라기보다는, 여러 미래 경로를 만들고 그 분포를 살펴보는 데 의미를 두었습니다. 80% 예측구간의 포함률은 80%에 가까운지와 구간의 폭을 함께 봐야 합니다.
+LSTM had the lowest point prediction error, while CT-VAE had the lowest CRPS in this comparison. Our main interest was generating possible future paths and examining their distributions. For an 80% prediction interval, coverage should be assessed against the 80% target together with the interval width.
 
-구성요소를 하나씩 빼 보는 ablation 실험도 진행했습니다. 발표 표에서 예측 오차, 예측구간 포함률, 하락 경로 비율만 추렸습니다.
+We also removed individual components to see how the results changed. The table below keeps three measures from the ablation results: prediction error, interval coverage, and the proportion of paths with a decline greater than 10%.
 
-| 구성 | MSE ↓ | 80% 예측구간 포함률 | 10% 초과 하락 경로 비율 |
+| Configuration | MSE ↓ | 80% interval coverage | Paths with >10% decline |
 |---|---:|---:|---:|
 | Full CT-VAE | 0.1989 | 51.00% | 14% |
-| Student-t 제거 | 0.1765 | 58.33% | 18% |
-| Macro Prior 제거 | 0.1920 | 33.33% | 10% |
-| FiLM 제거 | 0.1892 | 41.67% | 9% |
-| 추세·계절성 분해 제거 | 0.2033 | 51.00% | 22% |
+| Without Student-t | 0.1765 | 58.33% | 18% |
+| Without Macro Prior | 0.1920 | 33.33% | 10% |
+| Without FiLM | 0.1892 | 41.67% | 9% |
+| Without trend/seasonality decomposition | 0.2033 | 51.00% | 22% |
 
-일부 구성을 뺐을 때 오차가 더 낮아지기도 했습니다. 반면 Macro Prior나 FiLM을 뺐을 때는 예측구간 포함률이 낮아졌고, 추세·계절성 분해를 뺐을 때는 큰 하락 경로가 늘었습니다. 다만 Full 모델도 이 실험의 80% 구간 포함률이 51%여서, 불확실성 추정은 더 보완할 부분입니다. 이 표는 앞의 모델 비교와 별도 실험 결과이며, 하락 경로 비율이 작다는 이유만으로 모델이 더 정확하다고 볼 수는 없습니다.
+Removing some components reduced the error. However, removing the macro prior or FiLM reduced interval coverage, while removing the decomposition increased the proportion of large-decline paths. The full model's 80% interval coverage was only 51% in this experiment, so uncertainty calibration still needs work. These results come from a separate experiment from the model comparison above. A smaller proportion of declining paths alone does not establish better model accuracy.
 
-경제 조건을 바꿨을 때 결과가 어떻게 달라지는지도 확인했습니다. 아래는 **발표 자료의 마지막 시나리오 요약표**에서 가져온 값입니다. 기본 조건은 2025년 8월 기준입니다.
+We then changed the economic conditions. The following values come from the **final scenario summary table in the presentation**, using baseline conditions from August 2025.
 
-| 시나리오 | 수출 상승 경로 비율 | 10% 초과 하락 경로 비율 | 하위 10% 경로의 평균 변화율(ES) |
+| Scenario | Paths with rising exports | Paths with >10% decline | Mean change in the bottom 10% (ES) |
 |---|---:|---:|---:|
-| 기본 조건 | 98% | 2% | +1.1% |
-| 원/달러 환율 +10% | 88% | 8% | -18.5% |
-| 미국 10년물 금리(GS10) −15% | 80% | 14% | -18.0% |
-| 경기 회복 조건 | 96% | 2% | +3.6% |
+| Baseline | 98% | 2% | +1.1% |
+| KRW/USD exchange rate +10% | 88% | 8% | -18.5% |
+| U.S. 10-year Treasury yield (GS10) −15% | 80% | 14% | -18.0% |
+| Economic recovery | 96% | 2% | +3.6% |
 
-경기 회복 조건은 GS10 −15%, PMI +7%, CLI +2%, ISM +5%, 원/달러 환율 −6%를 함께 적용한 경우입니다. 환율이 오르는 조건에서는 하방 결과가 나빠졌고, 금리만 낮춘 조건도 전망이 개선되지는 않았습니다. 경기지표를 함께 개선한 조건에서는 하위 경로의 결과가 좋아졌습니다.
+The recovery scenario combines GS10 −15%, PMI +7%, CLI +2%, ISM +5%, and KRW/USD −6%. A higher KRW/USD exchange rate worsened the downside outcomes. Lowering the Treasury yield alone did not improve the outlook either. Changing the economic indicators together improved the outcomes in the lower tail.
 
-![경제 조건에 따른 예측 수출 분포 비교](assets/scenario-distributions.png)
+![Forecast export distributions under different economic conditions](assets/scenario-distributions.png)
 
-위 그림은 조건별로 생성한 수출 예측값의 분포입니다. 경기 회복 조건의 빨간 곡선은 기본 조건보다 오른쪽으로 이동해, 더 높은 수출 수준의 경로가 생성되는 모습을 보여줍니다.
+The red recovery curve shifts to the right of the baseline distribution, showing that the model generates paths with higher export levels under those conditions.
 
-상승 비율은 생성한 경로 중 기준 수출액보다 높아진 경로의 비율입니다. 실제 예측 적중률이나 주가 상승 확률을 뜻하지는 않습니다. 조건을 바꿨을 때의 모델 반응이므로 인과관계로 해석하기도 어렵습니다.
+The rising-path proportion counts generated paths that end above the reference export level. It is not a prediction accuracy score or a probability of stock prices rising. These experiments show the model's response to changed conditions and do not establish causal effects.
 
-<sub>시나리오 수치는 발표 마지막 요약표를 기준으로 옮겼습니다. 금리 하락 시나리오의 하락 비율·VaR·ES와 경기 회복 시나리오의 일부 값은 개별 설명 슬라이드와 요약표가 달라, 실행 로그와 대조해 정리할 필요가 있습니다.</sub>
+<sub>The scenario values above follow the final summary slide. Some values on the individual scenario slides differ, including the rate-decrease scenario's tail probability, VaR, and ES, and some recovery scenario values. These need to be reconciled against the experiment logs.</sub>
 
-## 코드와 실행
+## Code and running the experiments
 
-처음 살펴본다면 `model.py`와 `main.py`부터 보면 됩니다.
+If you are looking through the code for the first time, `model.py` and `main.py` are good starting points.
 
-| 파일 | 내용 |
+| File | Contents |
 |---|---|
-| `macro_pretrain.py` | 거시경제 인코더 사전학습 |
-| `model.py` | Encoder, Decoder, Conditional Prior, TimeVAE |
-| `data_train.py` | 전처리, 학습용 구간 구성, 학습 및 평가 함수 |
-| `main.py` | 모델 학습과 시나리오 실험 실행 |
-| `scenario_eval.py` | 경로 생성, 시각화, 확률·위험 지표 계산 |
-| `baseline_*.py` | ARIMA, LSTM, vanilla cVAE 비교 모델 |
-| `train_ablation_models.py`, `ablation_experiment.py` | 구성요소를 제거한 모델 학습 및 평가 |
-| `data.csv`, `macro.csv` | 반도체·거시경제 월별 데이터 |
+| `macro_pretrain.py` | Macroeconomic encoder pretraining |
+| `model.py` | Encoder, Decoder, Conditional Prior, and TimeVAE |
+| `data_train.py` | Preprocessing, sliding windows, training, and evaluation functions |
+| `main.py` | Model training and scenario experiments |
+| `scenario_eval.py` | Path generation, plots, and probabilistic and risk metrics |
+| `baseline_*.py` | ARIMA, LSTM, and vanilla cVAE baselines |
+| `train_ablation_models.py`, `ablation_experiment.py` | Training and evaluation for ablation variants |
+| `data.csv`, `macro.csv` | Monthly semiconductor and macroeconomic data |
 
-주요 라이브러리는 PyTorch, NumPy, pandas, scikit-learn, SciPy, statsmodels, matplotlib, joblib입니다. CSV 파일이 있는 프로젝트 폴더에서 실행합니다.
+The main dependencies are PyTorch, NumPy, pandas, scikit-learn, SciPy, statsmodels, matplotlib, and joblib. Run these commands from the project directory containing the CSV files:
 
 ```bash
 python macro_pretrain.py
 python main.py
 ```
 
-실험용 코드라 경로와 설정이 코드 안에 들어 있습니다. `main.py`의 epoch, 시나리오 조건, device 설정을 먼저 확인하는 편이 좋습니다. 현재 `macro_pretrain.py`는 import할 때도 최상위 코드가 실행되는 구조라 실행 흐름을 정리할 필요가 있습니다.
+This is experimental code, with paths and settings defined inside the scripts. Check the epochs, scenario conditions, and device setting in `main.py` before running it. Currently, `macro_pretrain.py` also runs its top-level code when imported, so the execution flow needs some cleanup.
 
-## 아직 남은 부분
+## What is still left to do
 
-데이터가 짧고 학습 구간도 많이 겹칩니다. 더 다양한 국가·산업 데이터를 추가하고, 시점별로 학습과 평가를 엄격하게 분리해 결과를 다시 확인하고 싶습니다. 현재 코드에서는 예측 기준 시점과 거시 인코더의 전처리 일치 여부도 보완해야 합니다.
+The dataset is short, and the training windows overlap substantially. We would like to add data from more countries and industries, and revisit the evaluation with stricter time-based separation between training and testing. The forecast origin and consistency of preprocessing for the macro encoder also need attention in the current implementation.
 
-GAN이나 Diffusion과의 직접 비교는 진행하지 않았습니다. 이후에는 경기 국면이 바뀌는 상황까지 반영하고, 시나리오 조건 자체를 생성하는 방향으로 확장해 볼 수 있을 것 같습니다.
-
----
+We have not directly compared this model with GANs or diffusion models. Other directions we would like to explore are handling changes in economic regimes and generating the scenario conditions themselves.
