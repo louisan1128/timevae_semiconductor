@@ -1,31 +1,33 @@
-# Semiconductor Cycles: Exploring Possible Futures
+# Conditional Time-VAE for Semiconductor Cycles
 
-**Generative Scenario Modeling for Semiconductor Industry Cycles**  
-An undergraduate team project using a Conditional Time-VAE to generate semiconductor export scenarios.
+**36 months of observations → 12 months of possible export paths**
 
-Semiconductor cycles are affected by exchange rates, interest rates, and manufacturing activity, as well as past export and price movements. We started this project with a question: could we use this information together to generate several possible paths for the industry?
+[Presentation](Generative%20Scenario%20Modeling%20for%20Semiconductor%20Industry%20Cycles.pdf) · [Notebook](Timevae_final.ipynb) · [Model](model.py)
 
-We tried scenarios with a weaker Korean won, lower interest rates, and improving economic indicators, then compared how the forecast distributions and downside risks changed.
+Exchange rates, interest rates, and manufacturing activity enter the model as conditions. Changing those inputs shifts the generated export distribution—and can change its downside tail even when most sampled paths still rise.
 
-[Presentation slides](Generative%20Scenario%20Modeling%20for%20Semiconductor%20Industry%20Cycles.pdf) · [Experiment notebook](Timevae_final.ipynb)
-
-## How we built it
+## From observations to sampled paths
 
 We used monthly semiconductor data from January 2010 to August 2025, including exports, DRAM, exchange rates, CAPEX, PMI, CLI, and ISM. The model takes **36 months of observations and generates the following 12 months**.
 
 There was not much data to train on at this frequency. To make use of a longer history, we first pretrained an encoder on FRED macroeconomic data starting in 1970, then connected its representations to the semiconductor model's conditional prior.
 
-The model was implemented in PyTorch. This is the overall architecture used in our presentation:
+The PyTorch implementation connects a pretrained macro encoder to a conditional Time-VAE:
 
 ![CT-VAE model architecture](assets/model-architecture.png)
 
 The temporal encoder uses TCNs with FiLM conditioning. The decoder combines **trend, seasonality, and residual components**, with a Student-t output distribution to represent large fluctuations. In the scenario experiments, we sample around the temporal encoder's latent distribution and change the economic conditions passed to the decoder.
 
-## What we found
-
-This is the forecast under the baseline conditions. The orange dashed line shows the median, and the shaded areas show quantile ranges across the generated paths. The vertical axis uses standardized values. This figure is from the original presentation.
+<details>
+<summary>Baseline forecast: median and quantile ranges</summary>
 
 ![Semiconductor export forecast under baseline conditions](assets/baseline-forecast.png)
+
+The orange dashed line shows the median; shaded bands show quantile ranges across generated paths. The vertical axis uses standardized values. This figure is from the original presentation.
+
+</details>
+
+## How the distributions compare
 
 We compared the model with ARIMA, LSTM, and vanilla cVAE. Along with prediction error, we evaluated the forecast distributions using NLL, CRPS, and prediction interval coverage.
 
@@ -40,6 +42,9 @@ Here are the main comparison results reported in the presentation. Lower MSE and
 
 LSTM had the lowest point prediction error, while CT-VAE had the lowest CRPS in this comparison. Our main interest was generating possible future paths and examining their distributions. For an 80% prediction interval, coverage should be assessed against the 80% target together with the interval width.
 
+<details>
+<summary>Removing individual components: ablation results</summary>
+
 We also removed individual components to see how the results changed. The table below keeps three measures from the ablation results: prediction error, interval coverage, and the proportion of paths with a decline greater than 10%.
 
 | Configuration | MSE ↓ | 80% interval coverage | Paths with >10% decline |
@@ -52,7 +57,15 @@ We also removed individual components to see how the results changed. The table 
 
 Removing some components reduced the error. However, removing the macro prior or FiLM reduced interval coverage, while removing the decomposition increased the proportion of large-decline paths. The full model's 80% interval coverage was only 51% in this experiment, so uncertainty calibration still needs work. These results come from a separate experiment from the model comparison above. A smaller proportion of declining paths alone does not establish better model accuracy.
 
-We then changed the economic conditions. The following values come from the **final scenario summary table in the presentation**, using baseline conditions from August 2025.
+</details>
+
+## Changing the economic conditions
+
+![Forecast export distributions under different economic conditions](assets/scenario-distributions.png)
+
+*Export distributions under four economic scenarios, from the original presentation. The recovery scenario shifts the distribution toward higher export levels.*
+
+Holding the observed history fixed, we changed the economic conditions passed to the decoder. The table follows the **final scenario summary in the presentation**, with baseline conditions from August 2025.
 
 | Scenario | Paths with rising exports | Paths with >10% decline | Mean change in the bottom 10% (ES) |
 |---|---:|---:|---:|
@@ -63,40 +76,31 @@ We then changed the economic conditions. The following values come from the **fi
 
 The recovery scenario combines GS10 −15%, PMI +7%, CLI +2%, ISM +5%, and KRW/USD −6%. A higher KRW/USD exchange rate worsened the downside outcomes. Lowering the Treasury yield alone did not improve the outlook either. Changing the economic indicators together improved the outcomes in the lower tail.
 
-![Forecast export distributions under different economic conditions](assets/scenario-distributions.png)
-
-The red recovery curve shifts to the right of the baseline distribution, showing that the model generates paths with higher export levels under those conditions.
-
 The rising-path proportion counts generated paths that end above the reference export level. It is not a prediction accuracy score or a probability of stock prices rising. These experiments show the model's response to changed conditions and do not establish causal effects.
 
 <sub>The scenario values above follow the final summary slide. Some values on the individual scenario slides differ, including the rate-decrease scenario's tail probability, VaR, and ES, and some recovery scenario values. These need to be reconciled against the experiment logs.</sub>
 
-## Code and running the experiments
+## Reading and running the code
 
-If you are looking through the code for the first time, `model.py` and `main.py` are good starting points.
+Start with [Timevae_final.ipynb](Timevae_final.ipynb) for the experiments, or follow the implementation through [model.py](model.py) → [main.py](main.py) → [scenario_eval.py](scenario_eval.py).
 
-| File | Contents |
-|---|---|
-| `macro_pretrain.py` | Macroeconomic encoder pretraining |
-| `model.py` | Encoder, Decoder, Conditional Prior, and TimeVAE |
-| `data_train.py` | Preprocessing, sliding windows, training, and evaluation functions |
-| `main.py` | Model training and scenario experiments |
-| `scenario_eval.py` | Path generation, plots, and probabilistic and risk metrics |
-| `baseline_*.py` | ARIMA, LSTM, and vanilla cVAE baselines |
-| `train_ablation_models.py`, `ablation_experiment.py` | Training and evaluation for ablation variants |
-| `data.csv`, `macro.csv` | Monthly semiconductor and macroeconomic data |
+`macro_pretrain.py` trains the macroeconomic encoder; `data_train.py` handles preprocessing, windows, and training. The `baseline_*.py` scripts contain the comparison models, and `train_ablation_models.py` / `ablation_experiment.py` contain the component experiments. Monthly inputs are in `data.csv` and `macro.csv`.
 
-The main dependencies are PyTorch, NumPy, pandas, scikit-learn, SciPy, statsmodels, matplotlib, and joblib. Run these commands from the project directory containing the CSV files:
+<details>
+<summary>Dependencies and execution notes</summary>
+
+The main dependencies are PyTorch, NumPy, pandas, scikit-learn, SciPy, statsmodels, matplotlib, and joblib. Run from the directory containing the CSV files:
 
 ```bash
 python macro_pretrain.py
 python main.py
 ```
 
-This is experimental code, with paths and settings defined inside the scripts. Check the epochs, scenario conditions, and device setting in `main.py` before running it. Currently, `macro_pretrain.py` also runs its top-level code when imported, so the execution flow needs some cleanup.
+Paths and settings are defined inside the scripts. Check the epochs, scenario conditions, and device setting in `main.py` before running. `macro_pretrain.py` currently executes its top-level code when imported, so the execution flow still needs cleanup.
 
-## What is still left to do
+</details>
 
-The dataset is short, and the training windows overlap substantially. We would like to add data from more countries and industries, and revisit the evaluation with stricter time-based separation between training and testing. The forecast origin and consistency of preprocessing for the macro encoder also need attention in the current implementation.
+## Remaining questions
 
-We have not directly compared this model with GANs or diffusion models. Other directions we would like to explore are handling changes in economic regimes and generating the scenario conditions themselves.
+The short monthly dataset and overlapping windows limit what these results establish. Stricter time-based evaluation, the forecast origin, and consistent preprocessing for the macro encoder still need attention. GAN and diffusion baselines have not been evaluated.
+
